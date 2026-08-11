@@ -6,7 +6,9 @@
 
 ### A. 탐색
 
-`/docs/` 하위 문서(PRD, ARCHITECTURE, ADR 등)를 읽고 프로젝트의 기획·아키텍처·설계 의도를 파악한다. 필요시 Explore 에이전트를 병렬로 사용한다.
+`/docs/` 하위 문서(PRD, ARCHITECTURE, ADR 등)와 `CLAUDE.md`를 읽고 프로젝트의 기획·아키텍처·설계 의도를 파악한다. 필요시 Explore 에이전트를 병렬로 사용한다.
+
+문서가 placeholder(`{...}`)로 남아 있거나 `CLAUDE.md`의 `## 명령어`가 비어 있으면 **여기서 멈추고** `/bootstrap`을 먼저 실행하라고 사용자에게 알린다. 검증 커맨드를 모르는 상태로 step을 설계하면 모든 AC가 틀린다.
 
 ### B. 논의
 
