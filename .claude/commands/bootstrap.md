@@ -31,6 +31,16 @@ A에서 판별한 빌드툴로 커맨드 후보를 만든다.
 | Gradle | `./gradlew build` | `./gradlew compileJava compileTestJava` | `./gradlew test` | `./gradlew bootRun` |
 | Maven | `./mvnw verify` | `./mvnw -q test-compile` | `./mvnw test` | `./mvnw spring-boot:run` |
 
+wrapper에 실행 권한이 없으면(`-rw-r--r--`) `./mvnw`가 `Permission denied`로 죽는다.
+이 경우 **`sh ./mvnw ...` 형태로 기록**하라. wrapper 파일 권한을 바꾸지 마라 — 저장소 상태를 건드리는 일이다.
+
+**테스트가 실제로 실행되는지 반드시 확인하라.** 부모 POM이나 빌드 스크립트가 테스트를 끄는 경우가 있다
+(예: parent pom의 `<skipTests>true</skipTests>`, Gradle `test { enabled = false }`).
+surefire 출력에 `Tests are skipped.`가 뜨거나 `Tests run:` 줄이 아예 없으면 **테스트는 돌지 않은 것이다.**
+이때 빌드 성공은 "컴파일 성공"과 같은 뜻이므로, `# 테스트 미실행` 주석을 달고 D단계에서 보고하라.
+플러그인 `<configuration>`에 하드코딩된 값은 `-DskipTests=false` 같은 CLI 옵션으로 덮이지 않는다.
+빌드 설정을 임의로 고치지 말고, 사용자에게 알리고 결정을 받아라.
+
 **그다음 컴파일 커맨드와 빌드 커맨드를 각각 1회 실행한다.** 둘 다 돌려야 한다.
 
 컴파일이 통과해도 빌드는 실패할 수 있다 — 기존 테스트 실패, checkstyle/spotless, coverage gate 등
