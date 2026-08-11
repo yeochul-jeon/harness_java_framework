@@ -599,3 +599,8 @@ class TestGitConfig:
         inst = self._make(tmp_project, {"branch_prefix": "hotfix/"})
         assert inst._branch_name() == "hotfix/ABC-1234"
         assert inst._commit_msg("수정") == "[ABC-1234] 수정"
+
+    def test_invalid_commit_format_falls_back(self, tmp_project, capsys):
+        inst = self._make(tmp_project, {"commit_format": "[{tickett}] {message}"})
+        assert inst._commit_msg("수정") == "[ABC-1234] 수정"
+        assert "WARN" in capsys.readouterr().out

@@ -118,7 +118,12 @@ class StepExecutor:
         return f"{self._branch_prefix}{self._phase_name}"
 
     def _commit_msg(self, message: str) -> str:
-        return self._commit_format.format(ticket=self._phase_name, message=message)
+        try:
+            return self._commit_format.format(ticket=self._phase_name, message=message)
+        except (KeyError, IndexError):
+            # commit_format 오타로 step 실행 도중 죽는 것을 막는다.
+            print(f"  WARN: commit_format '{self._commit_format}' 형식 오류 — 기본값 사용")
+            return self.DEFAULT_COMMIT_FORMAT.format(ticket=self._phase_name, message=message)
 
     def _checkout_branch(self):
         branch = self._branch_name()
