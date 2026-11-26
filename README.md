@@ -20,6 +20,7 @@ Claude Code로 Java/Spring 프로젝트를 step 단위로 자동 개발하는 �
 
 - [Claude Code](https://claude.ai/code) CLI
 - Python 3
+- jq (위험 커맨드 차단 hook의 입력 읽기용. 없으면 경고 후 검사 없이 통과)
 - Java + Spring 프로젝트 (Gradle Wrapper 또는 Maven Wrapper 포함)
 
 ## 설치
@@ -80,7 +81,7 @@ docs/
 └── STACK_PROFILE.md          # 사내/공용 프레임워크 설정 (선택 — 미사용 시 삭제)
 .claude/
 ├── commands/{bootstrap,harness,review}.md
-└── settings.json             # Stop hook(컴파일 검증) + 위험 커맨드 차단
+└── settings.json             # Stop hook(컴파일 검증) + 위험 커맨드 차단(hooks/guard-bash.sh)
 scripts/
 ├── execute.py                # step 실행기
 └── test_execute.py           # 실행기 테스트
