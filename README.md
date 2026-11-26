@@ -21,7 +21,7 @@ Claude Code로 Java/Spring 프로젝트를 step 단위로 자동 개발하는 �
 
 - [Claude Code](https://claude.ai/code) CLI
 - Python 3
-- jq (위험 커맨드 차단 hook의 입력 읽기용. 없으면 경고 후 검사 없이 통과)
+- jq (hook의 입력 읽기·차단 결과 출력용 — 위험 커맨드 차단, 컴파일 검증. 없으면 경고 후 검사 없이 통과)
 - Java + Spring 프로젝트 (Gradle Wrapper 또는 Maven Wrapper 포함)
 
 ## 설치
@@ -85,7 +85,7 @@ docs/
 └── STACK_PROFILE.md          # 사내/공용 프레임워크 설정 (선택 — 미사용 시 삭제)
 .claude/
 ├── commands/{bootstrap,harness,review}.md
-└── settings.json             # Stop hook(컴파일 검증) + 위험 커맨드 차단(hooks/guard-bash.sh)
+└── settings.json             # Stop hook(컴파일 검증, hooks/compile-gate.sh) + 위험 커맨드 차단(hooks/guard-bash.sh)
 scripts/
 ├── execute.py                # step 실행기
 └── test_execute.py           # 실행기 테스트
@@ -93,6 +93,19 @@ scripts/
 
 `docs/*.md`는 **매 step 프롬프트에 전부 주입된다.** 문서를 늘릴수록 토큰을 쓰고 신호가 희석되므로
 필요한 것만 남긴다.
+
+## 컴파일 검증 hook
+
+Claude가 응답을 끝낼 때마다 프로젝트 루트에서 컴파일 커맨드를 돌린다.
+실패하면 응답 종료를 한 번 막고 컴파일 오류 출력의 끝 200줄을 Claude에게 전달해 이어서 고치게 한다.
+
+- 한 번 막은 뒤 이어진 응답은 다시 검사하지 않는다. 다음 입력 뒤에 다시 검사한다.
+- 컴파일이 원래 깨져 있는 저장소에서는 응답마다 컴파일 1회와 추가 응답 1회가 더 든다.
+  먼저 컴파일을 고치거나, 고칠 때까지 `.claude/settings.json`의 Stop 항목을 빼 둔다.
+- 컴파일이 600초를 넘거나 jq가 없으면 검사 없이 통과한다.
+- `gradlew`·`mvnw`가 없으면 검사하지 않는다.
+- 항상 프로젝트 루트에서 컴파일한다. 세션 중 worktree로 옮겨도 세션을 시작한 프로젝트 루트를 컴파일한다.
+- `execute.py`가 띄우는 step 세션에서도 돈다.
 
 ## 브랜치·커밋 규칙 바꾸기
 
@@ -109,4 +122,6 @@ scripts/
 
 ```bash
 python3 -m pytest scripts/test_execute.py
+sh .claude/hooks/tests/guard-bash.test.sh
+sh .claude/hooks/tests/compile-gate.test.sh
 ```
