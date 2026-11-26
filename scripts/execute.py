@@ -10,6 +10,8 @@ import argparse
 import contextlib
 import json
 import os
+import re
+import signal
 import subprocess
 import sys
 import threading
@@ -54,6 +56,10 @@ class StepExecutor:
     """Phase 디렉토리 안의 step들을 순차 실행하는 하네스."""
 
     MAX_RETRIES = 3
+    BUILD_TIMEOUT = 1800
+    BUILD_TAIL_LINES = 40
+    DRAIN_TIMEOUT = 10
+    BUILD_TIMEOUT_HEAD = "AC 빌드 시간 초과"
     DEFAULT_BRANCH_PREFIX = "feature/"
     DEFAULT_COMMIT_FORMAT = "[{ticket}] {message}"
     TZ = timezone(timedelta(hours=9))
@@ -88,6 +94,7 @@ class StepExecutor:
         self._print_header()
         self._check_blockers()
         self._checkout_branch()
+        self._build_cmd = self._load_build_command()
         guardrails = self._load_guardrails()
         self._ensure_created_at()
         self._execute_all_steps(guardrails)
@@ -200,6 +207,51 @@ class StepExecutor:
                 sections.append(f"## {doc.stem}\n\n{doc.read_text()}")
         return "\n\n---\n\n".join(sections) if sections else ""
 
+    def _load_build_command(self) -> str:
+        """CLAUDE.md `## 명령어` 코드 블록의 둘째 줄(실행·빌드·테스트·컴파일 순)을 빌드 커맨드로 꺼낸다.
+
+        줄 전체를 셸에 넘긴다(뒤 주석은 셸이 버린다). 표시·placeholder 판정은 셸 문법을 해석하지 않고
+        줄 전체 문자열에서 찾는다 — 따옴표 안에 있어도 거부하는 쪽(안전한 쪽)으로 틀린다.
+        """
+        def stop(reason: str):
+            print(f"  ERROR: CLAUDE.md 빌드 커맨드를 쓸 수 없다 — {reason}")
+            print(f"  /bootstrap 을 먼저 실행하라.")
+            sys.exit(1)
+
+        claude_md = Path(self._root) / "CLAUDE.md"
+        if not claude_md.exists():
+            stop("CLAUDE.md 가 없다")
+        lines = claude_md.read_text(encoding="utf-8").splitlines()
+        if "## 명령어" not in lines:
+            stop("`## 명령어` 절이 없다")
+
+        block, inside, closed = [], False, False
+        for line in lines[lines.index("## 명령어") + 1:]:
+            if line.startswith("```"):
+                if inside:
+                    closed = True
+                    break
+                inside = True
+            elif line.startswith("## "):
+                break
+            elif inside and line.strip():
+                block.append(line.strip())
+        if not closed:
+            stop("`## 명령어` 의 코드 블록이 없거나 닫히지 않았다")
+        if len(block) != 4:
+            stop(f"코드 블록 줄이 4개(실행·빌드·테스트·컴파일)가 아니다: {len(block)}개")
+
+        line = block[1]
+        if line.startswith("#"):
+            stop(f"커맨드 없이 주석만 있다: {line}")
+        if re.search(r"\{[가-힣 ]+\}", line):
+            stop(f"placeholder 그대로다: {line}")
+        if "미검증" in line:
+            stop(f"`미검증` 표시가 있다: {line}")
+        if "테스트 미실행" in line:
+            print(f"  WARN: 빌드 줄에 `테스트 미실행` 표시가 있다 — AC 빌드는 테스트를 돌리지 않는다: {line}")
+        return line
+
     @staticmethod
     def _build_step_context(index: dict) -> str:
         lines = [
@@ -269,6 +321,47 @@ class StepExecutor:
 
         return output
 
+    def _run_build(self) -> Optional[str]:
+        """빌드 커맨드를 돌린다. 통과면 None, 실패·시간 초과면 다음 시도에 넘길 에러 문구."""
+        print(f"  AC 빌드: {self._build_cmd}")
+        proc = subprocess.Popen(
+            self._build_cmd, shell=True, cwd=self._root, start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        try:
+            out, _ = proc.communicate(timeout=self.BUILD_TIMEOUT)
+            head = f"AC 빌드 실패(exit {proc.returncode})"
+        except subprocess.TimeoutExpired:
+            # shell 만 죽이면 그 아래 빌드(JVM 등)가 남아 다음 시도와 겹친다 — 프로세스 그룹째 끝낸다.
+            self._kill_group(proc)
+            head = f"{self.BUILD_TIMEOUT_HEAD}({self.BUILD_TIMEOUT}초)"
+            try:
+                out, _ = proc.communicate(timeout=self.DRAIN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                # 그룹 밖으로 나간 프로세스가 출력 파이프를 쥐고 있다 — 출력 없이 진행한다.
+                proc.stdout.close()
+                proc.wait()  # 직접 자식은 이미 SIGKILL 을 받았다.
+                out = ""
+                head += f" — 출력 회수 {self.DRAIN_TIMEOUT}초 초과, 그룹 밖 프로세스가 파이프를 쥐고 있다"
+        except BaseException:
+            # 빌드는 별도 세션이라 실행기의 Ctrl-C 를 받지 못한다 — 실행기가 멈추면 함께 끝낸다.
+            self._kill_group(proc)
+            proc.wait()
+            raise
+        else:
+            if proc.returncode == 0:
+                return None
+        tail = "\n".join(out.splitlines()[-self.BUILD_TAIL_LINES:])
+        return f"{head}: {self._build_cmd}\n{tail}"
+
+    @staticmethod
+    def _kill_group(proc: subprocess.Popen):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # 그룹이 이미 끝났다.
+
     # --- 헤더 & 검증 ---
 
     def _print_header(self):
@@ -326,9 +419,24 @@ class StepExecutor:
             status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
             ts = self._stamp()
 
+            build_err = None
             if status == "completed":
+                # 빌드가 통과하기 전에는 completed 를 남기지 않는다 — 빌드 중 실행기가 죽으면 다음 실행이 이 step 을 다시 돈다.
                 for s in index["steps"]:
                     if s["step"] == step_num:
+                        s["status"] = "pending"
+                self._write_json(self._index_file, index)
+                build_err = self._run_build()
+                if build_err is not None:
+                    # 빌드가 통과하지 않은 세션의 요약은 다음 시도·다음 step 에 넘기지 않는다.
+                    for s in index["steps"]:
+                        if s["step"] == step_num:
+                            s.pop("summary", None)
+
+            if status == "completed" and build_err is None:
+                for s in index["steps"]:
+                    if s["step"] == step_num:
+                        s["status"] = "completed"
                         s["completed_at"] = ts
                 self._write_json(self._index_file, index)
                 self._commit_step(step_num, step_name)
@@ -346,12 +454,15 @@ class StepExecutor:
                 self._update_top_index("blocked")
                 sys.exit(2)
 
-            err_msg = next(
+            err_msg = build_err or next(
                 (s.get("error_message", "Step did not update status") for s in index["steps"] if s["step"] == step_num),
                 "Step did not update status",
             )
 
-            if attempt < self.MAX_RETRIES:
+            # 빌드 시간 초과는 코드보다 환경(JAVA_HOME·네트워크 등) 탓일 때가 많아 재시도해도 같다 — 그 자리에서 끝낸다.
+            timed_out = build_err is not None and build_err.startswith(self.BUILD_TIMEOUT_HEAD)
+
+            if attempt < self.MAX_RETRIES and not timed_out:
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s["status"] = "pending"
@@ -363,11 +474,11 @@ class StepExecutor:
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s["status"] = "error"
-                        s["error_message"] = f"[{self.MAX_RETRIES}회 시도 후 실패] {err_msg}"
+                        s["error_message"] = err_msg if timed_out else f"[{self.MAX_RETRIES}회 시도 후 실패] {err_msg}"
                         s["failed_at"] = ts
                 self._write_json(self._index_file, index)
                 self._commit_step(step_num, step_name)
-                print(f"  ✗ Step {step_num}: {step_name} failed after {self.MAX_RETRIES} attempts [{elapsed}s]")
+                print(f"  ✗ Step {step_num}: {step_name} failed after {attempt} attempts [{elapsed}s]")
                 print(f"    Error: {err_msg}")
                 self._update_top_index("error")
                 sys.exit(1)
@@ -377,6 +488,13 @@ class StepExecutor:
     def _execute_all_steps(self, guardrails: str):
         while True:
             index = self._read_json(self._index_file)
+            # completed_at 은 빌드 통과 뒤 실행기만 쓴다. 없으면 검증 전에 실행기가 멈춘 step 이다 — 다시 돈다.
+            unverified = [s for s in index["steps"] if s["status"] == "completed" and "completed_at" not in s]
+            for s in unverified:
+                s["status"] = "pending"
+                s.pop("summary", None)
+            if unverified:
+                self._write_json(self._index_file, index)
             pending = next((s for s in index["steps"] if s["status"] == "pending"), None)
             if pending is None:
                 print("\n  All steps completed!")

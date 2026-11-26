@@ -116,7 +116,7 @@
 ## Acceptance Criteria
 
 ```bash
-{CLAUDE.md `## 명령어`의 빌드 커맨드}   # 컴파일 + 테스트 일괄 통과
+{CLAUDE.md `## 명령어`의 빌드 커맨드}   # execute.py가 세션 뒤 같은 커맨드를 다시 돌려 완료를 판정한다
 ```
 
 ## 검증 절차
@@ -151,10 +151,14 @@ execute.py가 자동으로 처리하는 것:
 - 가드레일 주입 — CLAUDE.md + docs/*.md 내용을 매 step 프롬프트에 포함
 - 컨텍스트 누적 — 완료된 step의 summary를 다음 step 프롬프트에 전달
 - 자가 교정 — 실패 시 최대 3회 재시도하며, 이전 에러 메시지를 프롬프트에 피드백
+- 완료 검증 — 세션이 `completed`를 적으면 `## 명령어`의 빌드 커맨드를 직접 돌려 exit 0일 때만 완료로 확정. 실패는 재시도 1회로 세고, 빌드 시간 초과(30분)는 재시도 없이 error
 - 2단계 커밋 — 코드 변경과 메타데이터(`phases/` 상태 파일)를 분리 커밋
 - 타임스탬프 — started_at, completed_at, failed_at, blocked_at 자동 기록
+
+빌드는 execute.py를 띄운 셸의 환경으로 돈다. `JAVA_HOME`처럼 빌드에 필요한 환경변수를 그 셸에 먼저 설정하라. 없으면 빌드가 시간 초과까지 매달릴 수 있다.
 
 에러 복구:
 
 - **error 발생 시**: `phases/{ticket}/index.json`에서 해당 step의 `status`를 `"pending"`으로 바꾸고 `error_message`를 삭제한 뒤 재실행한다.
 - **blocked 발생 시**: `blocked_reason`에 적힌 사유를 해결한 뒤, `status`를 `"pending"`으로 바꾸고 `blocked_reason`을 삭제한 뒤 재실행한다.
+- **`status`를 직접 `"completed"`로 바꾼 경우**: `completed_at`이 없는 `completed`는 검증 전으로 보고 다시 실행한다.
