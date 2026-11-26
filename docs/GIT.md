@@ -24,12 +24,15 @@ python3 scripts/execute.py ABC-1234   # → feature/ABC-1234 브랜치에서 작
 [ABC-1234] step 2 order-service
 ```
 
-`execute.py`가 step마다 두 번 커밋한다.
+step 커밋은 `execute.py`가 한다. step을 수행하는 세션은 커밋하지 않는다.
+빌드를 통과한 step은 두 번(코드·메타) 커밋하고, 실패(error)하거나 중단(blocked)된 step은 `phases/` 상태 파일만 한 번 커밋한다. 빌드를 통과하지 않은 코드는 커밋하지 않는다.
 
 | 커밋 | 대상 | 메시지 |
 |------|------|--------|
 | 코드 | step에서 작성/수정한 소스 | `[ABC-1234] step {N} {step-name}` |
 | 메타 | `phases/` 아래 상태 파일 | `[ABC-1234] step {N} 산출물 기록` |
+| 실패 | `phases/` 아래 상태 파일 | `[ABC-1234] step {N} {step-name} 실패 기록` |
+| 중단 | `phases/` 아래 상태 파일 | `[ABC-1234] step {N} {step-name} 중단 기록` |
 
 ## 설정 — 다른 규칙을 쓰는 경우
 

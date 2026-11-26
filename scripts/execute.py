@@ -60,6 +60,8 @@ class StepExecutor:
     BUILD_TAIL_LINES = 40
     DRAIN_TIMEOUT = 10
     BUILD_TIMEOUT_HEAD = "AC 빌드 시간 초과"
+    SESSION_TIMEOUT = 1800
+    SESSION_TIMEOUT_HEAD = "세션 시간 초과"
     DEFAULT_BRANCH_PREFIX = "feature/"
     DEFAULT_COMMIT_FORMAT = "[{ticket}] {message}"
     TZ = timezone(timedelta(hours=9))
@@ -92,8 +94,9 @@ class StepExecutor:
 
     def run(self):
         self._print_header()
-        self._check_blockers()
+        self._check_clean_tree()
         self._checkout_branch()
+        self._check_blockers()
         self._build_cmd = self._load_build_command()
         guardrails = self._load_guardrails()
         self._ensure_created_at()
@@ -154,6 +157,48 @@ class StepExecutor:
             sys.exit(1)
 
         print(f"  Branch: {branch}")
+
+    def _check_clean_tree(self):
+        """phases/ 밖에 커밋되지 않은 변경(미추적 포함)이 있으면 목록을 보이고 멈춘다.
+
+        성공 커밋은 git add -A 라서, 실행 전부터 있던 변경이 step 커밋에 섞인다. 실패한 step 의 코드도
+        작업 트리에 남으므로(_commit_state) 사용자가 이어 쓸지(커밋)·보관(stash)·버릴지 정한 뒤 다시 돌린다.
+        """
+        # 경로는 표시만 한다 — 로캘로 못 읽는 이름 하나 때문에 검사가 죽지 않게 바꿔 읽는다.
+        r = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"],
+            cwd=self._root, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        if r.returncode != 0:
+            print(f"  ERROR: git status 실패 — git 저장소인지 확인하라.")
+            print(f"  {r.stderr.strip()}")
+            sys.exit(1)
+        dirty = [e for e in r.stdout.split("\0") if e and not e[3:].startswith("phases/")]
+        if dirty:
+            print(f"  ERROR: phases/ 밖에 커밋되지 않은 변경이 있다 — 커밋·stash·폐기 중 하나로 정리한 뒤 다시 실행하라.")
+            for e in dirty:
+                print(f"    {e[:2]} {e[3:]}")
+            sys.exit(1)
+
+    def _commit_state(self, step_num: int, note: str):
+        """phases/ 상태 파일만 커밋한다. 빌드를 통과하지 않은 코드는 staged 여도 커밋에 넣지 않고 작업 트리에 둔다."""
+        # phase index 는 늘 있다(__init__ 이 확인) — 경로 목록이 비어 `--` 뒤가 빈 전체 커밋이 되지 않는다.
+        # stepN-output.json 은 넣지 않는다 — .gitignore 가 무시하는 경로를 git add 에 명시하면 add 가 실패해 커밋 전체가 빠진다.
+        paths = [f"phases/{self._phase_dir_name}/index.json"]
+        if (Path(self._root) / "phases/index.json").exists():
+            paths.append("phases/index.json")
+        r = self._run_git("add", "--", *paths)
+        if r.returncode != 0:
+            print(f"  WARN: 상태 커밋 실패(git add): {r.stderr.strip()}")
+            return
+        if self._run_git("diff", "--cached", "--quiet", "--", *paths).returncode == 0:
+            return
+        msg = self._commit_msg(f"step {step_num} {note}")
+        r = self._run_git("commit", "-m", msg, "--", *paths)
+        if r.returncode == 0:
+            print(f"  Commit: {msg}")
+        else:
+            print(f"  WARN: 상태 커밋 실패: {r.stderr.strip()}")
 
     def _commit_step(self, step_num: int, step_name: str):
         output_rel = f"phases/{self._phase_dir_name}/step{step_num}-output.json"
@@ -265,7 +310,6 @@ class StepExecutor:
 
     def _build_preamble(self, guardrails: str, step_context: str,
                         prev_error: Optional[str] = None) -> str:
-        commit_example = self._commit_msg("step N <step-name>")
         retry_section = ""
         if prev_error:
             retry_section = (
@@ -285,8 +329,7 @@ class StepExecutor:
             f"   - AC 통과 → \"completed\" + \"summary\" 필드에 이 step의 산출물을 한 줄로 요약\n"
             f"   - {self.MAX_RETRIES}회 수정 시도 후에도 실패 → \"error\" + \"error_message\" 기록\n"
             f"   - 사용자 개입이 필요한 경우 (API 키, 인증, 수동 설정 등) → \"blocked\" + \"blocked_reason\" 기록 후 즉시 중단\n"
-            f"6. 모든 변경사항을 커밋하라:\n"
-            f"   {commit_example}\n\n---\n\n"
+            f"6. 커밋하지 마라. 실행기가 AC 빌드를 다시 돌려 통과하면 커밋한다.\n\n---\n\n"
         )
 
     # --- Claude 호출 ---
@@ -300,20 +343,41 @@ class StepExecutor:
             sys.exit(1)
 
         prompt = preamble + step_file.read_text()
-        result = subprocess.run(
+        # 세션이 띄운 빌드·셸이 시간 초과 뒤에도 남지 않게 별도 프로세스 그룹으로 띄운다(_run_build 와 같은 이유).
+        proc = subprocess.Popen(
             ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
-            cwd=self._root, capture_output=True, text=True, timeout=1800,
+            cwd=self._root, start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
+        timed_out = False
+        try:
+            stdout, stderr = proc.communicate(timeout=self.SESSION_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            self._kill_group(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=self.DRAIN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                proc.stdout.close()
+                proc.stderr.close()
+                proc.wait()
+                stdout, stderr = "", ""
+        except BaseException:
+            self._kill_group(proc)
+            proc.wait()
+            raise
 
-        if result.returncode != 0:
-            print(f"\n  WARN: Claude가 비정상 종료됨 (code {result.returncode})")
-            if result.stderr:
-                print(f"  stderr: {result.stderr[:500]}")
+        if timed_out:
+            print(f"\n  WARN: {self.SESSION_TIMEOUT_HEAD}({self.SESSION_TIMEOUT}초) — 세션 프로세스 그룹을 끝냈다")
+        elif proc.returncode != 0:
+            print(f"\n  WARN: Claude가 비정상 종료됨 (code {proc.returncode})")
+            if stderr:
+                print(f"  stderr: {stderr[:500]}")
 
         output = {
             "step": step_num, "name": step_name,
-            "exitCode": result.returncode,
-            "stdout": result.stdout, "stderr": result.stderr,
+            "exitCode": proc.returncode, "timedOut": timed_out,
+            "stdout": stdout, "stderr": stderr,
         }
         out_path = self._phase_dir / f"step{step_num}-output.json"
         with open(out_path, "w") as f:
@@ -374,7 +438,7 @@ class StepExecutor:
 
     def _check_blockers(self):
         index = self._read_json(self._index_file)
-        for s in reversed(index["steps"]):
+        for s in index["steps"]:
             if s["status"] == "error":
                 print(f"\n  ✗ Step {s['step']} ({s['name']}) failed.")
                 print(f"  Error: {s.get('error_message', 'unknown')}")
@@ -385,8 +449,6 @@ class StepExecutor:
                 print(f"  Reason: {s.get('blocked_reason', 'unknown')}")
                 print(f"  Resolve and reset status to 'pending' to retry.")
                 sys.exit(2)
-            if s["status"] != "pending":
-                break
 
     def _ensure_created_at(self):
         index = self._read_json(self._index_file)
@@ -412,11 +474,21 @@ class StepExecutor:
                 tag += f" [retry {attempt}/{self.MAX_RETRIES}]"
 
             with progress_indicator(tag) as pi:
-                self._invoke_claude(step, preamble)
+                out = self._invoke_claude(step, preamble)
                 elapsed = int(pi.elapsed)
 
-            index = self._read_json(self._index_file)
-            status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
+            session_err = None
+            if out.get("timedOut"):
+                # 끝나지 않은 세션이 적은 completed·blocked·summary 는 믿지 않는다. 쓰다 잘린 index 일 수도 있어
+                # 다시 읽지 않고, 세션 호출 전에 읽어 둔 index 에 기록한다.
+                session_err = f"{self.SESSION_TIMEOUT_HEAD}({self.SESSION_TIMEOUT}초)"
+                status = "timeout"
+                for s in index["steps"]:
+                    if s["step"] == step_num:
+                        s.pop("summary", None)
+            else:
+                index = self._read_json(self._index_file)
+                status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
             ts = self._stamp()
 
             build_err = None
@@ -452,15 +524,18 @@ class StepExecutor:
                 print(f"  ⏸ Step {step_num}: {step_name} blocked [{elapsed}s]")
                 print(f"    Reason: {reason}")
                 self._update_top_index("blocked")
+                self._commit_state(step_num, f"{step_name} 중단 기록")
                 sys.exit(2)
 
-            err_msg = build_err or next(
+            err_msg = build_err or session_err or next(
                 (s.get("error_message", "Step did not update status") for s in index["steps"] if s["step"] == step_num),
                 "Step did not update status",
             )
 
             # 빌드 시간 초과는 코드보다 환경(JAVA_HOME·네트워크 등) 탓일 때가 많아 재시도해도 같다 — 그 자리에서 끝낸다.
-            timed_out = build_err is not None and build_err.startswith(self.BUILD_TIMEOUT_HEAD)
+            # 세션 시간 초과도 같다 — 재시도하면 최악 MAX_RETRIES × SESSION_TIMEOUT 을 기다린다.
+            timed_out = session_err is not None or (
+                build_err is not None and build_err.startswith(self.BUILD_TIMEOUT_HEAD))
 
             if attempt < self.MAX_RETRIES and not timed_out:
                 for s in index["steps"]:
@@ -477,10 +552,12 @@ class StepExecutor:
                         s["error_message"] = err_msg if timed_out else f"[{self.MAX_RETRIES}회 시도 후 실패] {err_msg}"
                         s["failed_at"] = ts
                 self._write_json(self._index_file, index)
-                self._commit_step(step_num, step_name)
+                self._update_top_index("error")
+                # 빌드를 통과하지 않은 코드는 커밋하지 않는다 — 상태만 남기고 코드는 작업 트리에 둔다.
+                self._commit_state(step_num, f"{step_name} 실패 기록")
                 print(f"  ✗ Step {step_num}: {step_name} failed after {attempt} attempts [{elapsed}s]")
                 print(f"    Error: {err_msg}")
-                self._update_top_index("error")
+                print(f"    빌드를 통과하지 않은 변경은 커밋하지 않고 작업 트리에 남겼다(git status).")
                 sys.exit(1)
 
         return False  # unreachable

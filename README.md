@@ -11,8 +11,8 @@ Claude Code로 Java/Spring 프로젝트를 step 단위로 자동 개발하는 �
 2. `execute.py`가 각 step을 Claude Code(`claude -p`)에 순차 전달한다
 3. Claude가 코드를 작성하고 **`CLAUDE.md`의 `## 명령어`에 적힌 빌드 커맨드**로 검증한다
 4. Claude가 완료를 보고하면 `execute.py`가 같은 빌드 커맨드를 직접 다시 돌려 exit 0일 때만 완료로 확정한다
-5. 실패하면 이전 에러를 프롬프트에 피드백해 최대 3회 재시도한다 (빌드 시간 초과는 재시도 없이 중단)
-6. 성공하면 코드/메타데이터를 분리 커밋하고 다음 step으로 넘어간다
+5. 실패하면 이전 에러를 프롬프트에 피드백해 최대 3회 재시도한다 (빌드 시간 초과·세션 시간 초과는 재시도 없이 중단)
+6. 성공하면 코드/메타데이터를 분리 커밋하고 다음 step으로 넘어간다. 끝내 실패하거나 blocked로 끝나면 `phases/` 상태 파일만 커밋하고, 빌드를 통과하지 않은 코드는 커밋하지 않고 작업 트리에 남긴다
 
 빌드툴·Java/Spring 버전·영속성·아키텍처 패턴은 고정하지 않는다. 프로젝트마다 다르므로
 `/bootstrap`이 기존 소스를 분석해 문서를 채운다.
@@ -66,6 +66,9 @@ cp    harness_java_framework/CLAUDE.md my-project/
 python3 scripts/execute.py ABC-1234          # 순차 실행
 python3 scripts/execute.py ABC-1234 --push   # 완료 후 push
 ```
+
+`phases/` 밖에 커밋되지 않은 변경(미추적 파일 포함)이 있으면 `execute.py`는 목록을 보이고 멈춘다.
+`/bootstrap`이 채운 문서를 포함해 그런 변경은 먼저 커밋한 뒤 실행한다.
 
 변경 사항 리뷰는 `/review`.
 
