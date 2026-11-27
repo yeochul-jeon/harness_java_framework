@@ -11,9 +11,11 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -62,6 +64,18 @@ class StepExecutor:
     BUILD_TIMEOUT_HEAD = "AC 빌드 시간 초과"
     SESSION_TIMEOUT = 1800
     SESSION_TIMEOUT_HEAD = "세션 시간 초과"
+    _UNCHECKED = object()  # _session_branch 를 _execute_single_step 이 아직 적지 않았다(브랜치 비교를 하지 않는다).
+    EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    BUILD_FILES = {"pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+                   "gradle.properties", "maven.config"}
+    # 판정 기준을 느슨하게 만드는 설정. 정규식 수준 관찰이라 오탐·누락이 있다(경고만 하고 막지 않는다).
+    DISABLE_RE = re.compile(r"@(Disabled\w*|Ignore)\b")
+    BUILD_SKIP_RE = re.compile(
+        r"<skipTests>\s*true|skipTests\s*=\s*true|-DskipTests\b(?!=false)"
+        r"|maven\.test\.skip\s*(>|=)\s*true|-Dmaven\.test\.skip\b(?!=false)"
+        r"|testFailureIgnore\s*(>|=)\s*true|ignoreFailures\s*=\s*true|\benabled\s*=\s*false"
+        r"|-x\s+test\b|--exclude-task[=\s]+test\b"
+    )
     DEFAULT_BRANCH_PREFIX = "feature/"
     DEFAULT_COMMIT_FORMAT = "[{ticket}] {message}"
     TZ = timezone(timedelta(hours=9))
@@ -73,6 +87,7 @@ class StepExecutor:
         self._phase_dir_name = phase_dir_name
         self._top_index_file = self._phases_dir / "index.json"
         self._auto_push = auto_push
+        self._session_branch = self._UNCHECKED  # 세션 직전 브랜치 — 세션이 브랜치를 바꿨으면 출력을 저장하지 않는다.
 
         if not self._phase_dir.is_dir():
             print(f"ERROR: {self._phase_dir} not found")
@@ -179,6 +194,117 @@ class StepExecutor:
             for e in dirty:
                 print(f"    {e[:2]} {e[3:]}")
             sys.exit(1)
+
+    def _git_state(self) -> tuple:
+        """(HEAD 커밋, 브랜치 이름). git 이 아니거나 커밋이 없으면 None, detached HEAD 면 브랜치 None."""
+        head = self._run_git("rev-parse", "--verify", "-q", "HEAD")
+        branch = self._run_git("symbolic-ref", "-q", "--short", "HEAD")
+        return (head.stdout.strip() if head.returncode == 0 else None,
+                branch.stdout.strip() if branch.returncode == 0 else None)
+
+    def _session_git_violation(self, before: tuple, after: tuple) -> Optional[str]:
+        """세션이 커밋하거나 HEAD·브랜치를 바꿨으면 그 문구. 실행기는 세션 앞뒤로 커밋하지 않는다."""
+        (h0, b0), (h1, b1) = before, after
+        if b0 != b1:
+            return f"세션이 브랜치를 바꿈({b0 or 'detached'} → {b1 or 'detached'}, HEAD {h0} → {h1})"
+        if h0 == h1:
+            return None
+        if h1 is None:
+            return f"세션 중 HEAD 가 사라짐(브랜치 {b1 or 'detached'} 의 ref 삭제 등, HEAD {h0} → 없음)"
+        if h0 is None or self._run_git("merge-base", "--is-ancestor", h0, h1).returncode == 0:
+            n = self._run_git("rev-list", "--count", f"{h0}..{h1}" if h0 else h1).stdout.strip()
+            return f"세션이 커밋함(HEAD {h0} → {h1}, 새 커밋 {n}개)"
+        return f"세션 중 HEAD 가 바뀜(되감기·amend 등, HEAD {h0} → {h1})"
+
+    def _scan_criteria(self, base: Optional[str]) -> list:
+        """base 커밋 대비 지금 작업 트리(미추적 포함)에서 판정 기준을 바꾸는 변경을 찾아 문구 목록으로 돌려준다.
+
+        실제 index 를 복사한 임시 index 에만 git add -A 한다 — 실제 index·작업 트리·ref 는 건드리지 않는다.
+        """
+        def warn(r):
+            print(f"  WARN: 판정 기준 검사 실패 — {r.stderr.strip()[:200]}")
+            return []
+
+        real = self._run_git("rev-parse", "--git-path", "index")
+        if real.returncode != 0:
+            return warn(real)
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(prefix="harness-index-")
+            os.close(fd)
+            os.unlink(tmp)
+            real_index = Path(self._root) / real.stdout.strip()
+            if real_index.exists():
+                shutil.copyfile(real_index, tmp)
+            env = {**os.environ, "GIT_INDEX_FILE": tmp}
+
+            def git(*args):
+                return subprocess.run(["git", *args], cwd=self._root, env=env, capture_output=True,
+                                      text=True, encoding="utf-8", errors="replace")
+
+            r = git("add", "-A")
+            if r.returncode != 0:
+                return warn(r)
+            base = base or self.EMPTY_TREE
+            r = git("diff", "--cached", "-M", "-z", "--name-status", base)
+            if r.returncode != 0:
+                return warn(r)
+
+            def count(text, pattern):
+                n = 0
+                for line in text.splitlines():
+                    if line.strip().startswith(("//", "*", "/*", "<!--", "#")):
+                        continue
+                    n += len(pattern.findall(line))
+                return n
+
+            def is_test(path):
+                return bool(re.search(r"(^|/)src/test/", path) or re.search(r"(Test|Tests|IT)\.(java|kt|groovy)$", path))
+
+            def is_rule(path):
+                return path == "CLAUDE.md" or path.endswith("/CLAUDE.md") or path.startswith(".claude/")
+
+            found = []
+            tokens = r.stdout.split("\0")
+            i = 0
+            while i < len(tokens) and tokens[i]:
+                code = tokens[i]
+                if code[0] in "RC":
+                    old, new = tokens[i + 1], tokens[i + 2]
+                    i += 3
+                else:
+                    old = new = tokens[i + 1]
+                    i += 2
+                shown = new if old == new else f"{old} → {new}"
+                if is_rule(old) or is_rule(new):
+                    found.append(f"규칙 파일 변경: {shown}")
+                if code == "D" and is_test(old):
+                    found.append(f"테스트 파일 삭제: {old}")
+                if code[0] == "R" and is_test(old) and not is_test(new):
+                    found.append(f"테스트 파일 이동(테스트 경로 밖): {shown}")
+                if code == "D":
+                    continue
+                checks = []
+                if is_test(new) and new.endswith((".java", ".kt", ".groovy")):
+                    checks.append(("테스트 비활성화 추가", self.DISABLE_RE))
+                if Path(new).name in self.BUILD_FILES:
+                    checks.append(("빌드 파일 테스트 생략 설정 추가", self.BUILD_SKIP_RE))
+                if not checks:
+                    continue
+                old_text = git("show", f"{base}:{old}").stdout if code[0] not in "AC" else ""  # C 는 새 파일
+                new_text = git("show", f":{new}").stdout
+                for label, pattern in checks:
+                    gained = count(new_text, pattern) - count(old_text, pattern)
+                    if gained > 0:
+                        found.append(f"{label}(+{gained}): {new}")
+            return found
+        except OSError as e:
+            # 관찰용 검사다 — 임시 파일 문제로 완료·재시도·실패 기록을 막지 않는다.
+            print(f"  WARN: 판정 기준 검사 실패 — {e}")
+            return []
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
 
     def _commit_state(self, step_num: int, note: str):
         """phases/ 상태 파일만 커밋한다. 빌드를 통과하지 않은 코드는 staged 여도 커밋에 넣지 않고 작업 트리에 둔다."""
@@ -380,6 +506,11 @@ class StepExecutor:
             "stdout": stdout, "stderr": stderr,
         }
         out_path = self._phase_dir / f"step{step_num}-output.json"
+        switched = self._session_branch is not self._UNCHECKED and self._git_state()[1] != self._session_branch
+        if switched or not self._phase_dir.is_dir():
+            # 세션이 브랜치를 바꿨다 — 다른 브랜치의 작업 트리에 파일을 만들거나 덮어쓰지 않는다.
+            print(f"  WARN: 세션이 브랜치를 바꿨거나 {self._phase_dir} 가 없어 세션 출력을 저장하지 않았다")
+            return output
         with open(out_path, "w") as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
 
@@ -463,6 +594,8 @@ class StepExecutor:
         step_num, step_name = step["step"], step["name"]
         done = sum(1 for s in self._read_json(self._index_file)["steps"] if s["status"] == "completed")
         prev_error = None
+        # 판정 기준 경고는 step 시작 HEAD 대비 누적 변경으로 본다.
+        step_base = self._git_state()[0]
 
         for attempt in range(1, self.MAX_RETRIES + 1):
             index = self._read_json(self._index_file)
@@ -473,16 +606,39 @@ class StepExecutor:
             if attempt > 1:
                 tag += f" [retry {attempt}/{self.MAX_RETRIES}]"
 
+            # 세션 커밋 감지는 시도마다 직전 값과 비교한다 — 앞 시도의 빌드가 HEAD 를 바꿨어도 다음 세션 탓으로 돌리지 않는다.
+            git_before = self._git_state()
+            self._session_branch = git_before[1]
             with progress_indicator(tag) as pi:
                 out = self._invoke_claude(step, preamble)
                 elapsed = int(pi.elapsed)
 
+            git_after = self._git_state()
+            violation = self._session_git_violation(git_before, git_after)
+            if git_before[1] != git_after[1]:
+                # 브랜치가 바뀐 트리에는 phase 상태를 쓰지도 커밋하지도 않는다. 되돌리기는 사용자가 한다.
+                print(f"  ✗ Step {step_num}: {step_name} — {violation}")
+                back = git_before[1] or f"--detach {git_before[0]}"
+                print(f"    index·커밋에 기록하지 않았다. `git switch {back}` 로 돌아가 정리한 뒤 다시 실행하라.")
+                sys.exit(1)
+
             session_err = None
             if out.get("timedOut"):
-                # 끝나지 않은 세션이 적은 completed·blocked·summary 는 믿지 않는다. 쓰다 잘린 index 일 수도 있어
-                # 다시 읽지 않고, 세션 호출 전에 읽어 둔 index 에 기록한다.
                 session_err = f"{self.SESSION_TIMEOUT_HEAD}({self.SESSION_TIMEOUT}초)"
-                status = "timeout"
+            if violation:
+                note = ""
+                if not out.get("timedOut"):
+                    try:
+                        disk = next(s for s in self._read_json(self._index_file)["steps"] if s["step"] == step_num)
+                        if disk.get("status") == "blocked":
+                            note = f" — 세션은 blocked 로 보고: {disk.get('blocked_reason', '')}"
+                    except (OSError, ValueError, StopIteration, TypeError, KeyError, AttributeError):
+                        pass  # 세션이 index 를 깨뜨렸다 — 사유 없이 위반만 적는다.
+                session_err = "; ".join(x for x in (violation + note, session_err) if x)
+            if session_err:
+                # 끝나지 않았거나 규칙을 어긴 세션이 적은 completed·blocked·summary 는 믿지 않는다. 쓰다 잘린 index 일 수도
+                # 있어 다시 읽지 않고, 세션 호출 전에 읽어 둔 index 에 기록한다.
+                status = "session-error"
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s.pop("summary", None)
@@ -490,6 +646,22 @@ class StepExecutor:
                 index = self._read_json(self._index_file)
                 status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
             ts = self._stamp()
+
+            # 판정 기준 변경 경고(관찰만). 세션이 이 필드를 적었어도 실행기 값으로 덮어쓴다.
+            try:
+                warnings = self._scan_criteria(step_base)
+            except Exception as e:
+                # 관찰용 검사다 — 어떤 예외도 빌드·재시도·실패 기록을 막지 않게 하고, 실패는 WARN 으로 남긴다.
+                print(f"  WARN: 판정 기준 검사 실패 — {type(e).__name__}: {e}")
+                warnings = []
+            for s in index["steps"]:
+                if s["step"] == step_num:
+                    if warnings:
+                        s["criteria_warnings"] = warnings
+                    else:
+                        s.pop("criteria_warnings", None)
+            if warnings:
+                print(f"  ⚠ 판정 기준 변경 {len(warnings)}건 — " + "; ".join(warnings))
 
             build_err = None
             if status == "completed":
@@ -534,6 +706,7 @@ class StepExecutor:
 
             # 빌드 시간 초과는 코드보다 환경(JAVA_HOME·네트워크 등) 탓일 때가 많아 재시도해도 같다 — 그 자리에서 끝낸다.
             # 세션 시간 초과도 같다 — 재시도하면 최악 MAX_RETRIES × SESSION_TIMEOUT 을 기다린다.
+            # 세션 커밋도 재시도하지 않는다 — 커밋은 이미 이력에 있고, 재시도는 그 위에 쌓는다.
             timed_out = session_err is not None or (
                 build_err is not None and build_err.startswith(self.BUILD_TIMEOUT_HEAD))
 

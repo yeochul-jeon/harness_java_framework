@@ -246,7 +246,7 @@ class TestBuildPreamble:
         assert "이전 Step 산출물" in result
 
     def test_no_commit_example(self, executor):
-        # P10: 세션은 커밋하지 않는다 — 커밋 예시를 주지 않는다.
+        # 세션은 커밋하지 않는다 — 커밋 예시를 주지 않는다.
         result = executor._build_preamble("", "")
         assert "[ABC-1234] step N" not in result
 
@@ -612,7 +612,7 @@ class TestGitConfig:
 
 
 # ---------------------------------------------------------------------------
-# P5: AC 빌드 게이트 — CLAUDE.md `## 명령어` 빌드 줄을 세션 뒤 직접 실행
+# AC 빌드 게이트 — CLAUDE.md `## 명령어` 빌드 줄을 세션 뒤 직접 실행
 # ---------------------------------------------------------------------------
 
 import signal
@@ -857,7 +857,7 @@ class TestRunOrder:
         executor._load_build_command = lambda: order.append("_load_build_command") or "true"
         executor.run()
         assert order.index("_load_build_command") > order.index("_checkout_branch")
-        # P10: 트리 검사는 checkout 전(부작용 없이 멈춤), 차단 판정은 checkout 뒤(전환된 브랜치의 index).
+        # 트리 검사는 checkout 전(부작용 없이 멈춤), 차단 판정은 checkout 뒤(전환된 브랜치의 index).
         assert order.index("_check_clean_tree") < order.index("_checkout_branch") < order.index("_check_blockers")
 
 
@@ -1005,7 +1005,7 @@ class TestUnverifiedCompleted:
 
 
 # ---------------------------------------------------------------------------
-# P10: 실패 경로 — 미검증 코드 커밋(A), 작업 트리 확인(B), 세션 시간 초과(C), 차단 판정(D)
+# 실패 경로 — 미검증 코드 커밋, 작업 트리 확인, 세션 시간 초과, 차단 판정
 # ---------------------------------------------------------------------------
 
 SUCCESS_MSG = "[ABC-1234] step 2 ui"
@@ -1071,7 +1071,7 @@ def _head_step2(g):
 
 
 class TestFailureDoesNotCommitUnverifiedCode:
-    """A: 빌드가 통과하지 않은 코드는 성공 메시지 커밋에 들어가지 않는다."""
+    """빌드가 통과하지 않은 코드는 성공 메시지 커밋에 들어가지 않는다."""
 
     def _fail(self, executor):
         executor._build_cmd = "exit 1"
@@ -1123,7 +1123,7 @@ class TestFailureDoesNotCommitUnverifiedCode:
 
 
 class TestCleanTreeBeforeRun:
-    """B: phases/ 밖에 커밋되지 않은 변경이 있으면 실행 전에 목록을 보이고 멈춘다."""
+    """phases/ 밖에 커밋되지 않은 변경이 있으면 실행 전에 목록을 보이고 멈춘다."""
 
     STEPS = ["_print_header", "_check_blockers", "_checkout_branch", "_load_guardrails",
              "_ensure_created_at", "_execute_all_steps", "_finalize"]
@@ -1215,7 +1215,7 @@ def _fake_claude(bin_dir, pid_file, calls_file, index_file):
 
 
 class TestSessionTimeout:
-    """C: 세션 시간 초과는 traceback 없이, 재시도 없이 error 로 끝나고, 세션이 띄운 프로세스도 끝낸다."""
+    """세션 시간 초과는 traceback 없이, 재시도 없이 error 로 끝나고, 세션이 띄운 프로세스도 끝낸다."""
 
     def test_session_timeout_ends_step_as_error(self, executor, tmp_project, monkeypatch):
         bin_dir, pid_file, calls_file = tmp_project / "bin", tmp_project / "child.pid", tmp_project / "calls"
@@ -1255,7 +1255,7 @@ class TestSessionTimeout:
 
 
 class TestCheckBlockersAllSteps:
-    """D: 뒤쪽 step 이 completed 여도 앞쪽 error·blocked 를 본다."""
+    """뒤쪽 step 이 completed 여도 앞쪽 error·blocked 를 본다."""
 
     def _make(self, tmp_project, steps):
         return TestCheckBlockers()._make_executor_with_steps(tmp_project, steps)
@@ -1293,7 +1293,7 @@ class TestCheckBlockersAllSteps:
         """main 에서 띄웠는데 feature 브랜치 index 에 error 가 있으면 step 을 돌리지 않고 멈춘다."""
         idx = json.loads(executor._index_file.read_text())
         for s in idx["steps"][:2]:
-            s["completed_at"] = "2026-11-26T09:00:00+0900"  # 검증된 completed (P5 재실행 대상 아님)
+            s["completed_at"] = "2026-11-26T09:00:00+0900"  # 검증된 completed (재실행 대상 아님)
         executor._index_file.write_text(json.dumps(idx, ensure_ascii=False))
         git_repo("commit", "-q", "-am", "step 0·1 완료")
         git_repo("checkout", "-q", "-b", "feature/ABC-1234")
@@ -1391,3 +1391,347 @@ class TestSessionTimeoutTruncatedIndex:
         assert s["error_message"].startswith("세션 시간 초과")
         executor._commit_state.assert_called_once()
         executor._commit_step.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 세션 커밋 감지, 판정 기준 변경 경고
+# ---------------------------------------------------------------------------
+
+def _session_acts(executor, actions, status="completed", **extra):
+    """세션 흉내: 시도마다 actions[i](root) 를 돌린 뒤(마지막 것을 반복) index 의 step 2 status 를 적는다.
+    action 이 dict 를 돌려주면 그것을 _invoke_claude 반환값으로 쓴다(timedOut 등)."""
+    calls = []
+
+    def fake_invoke(step, preamble):
+        calls.append(preamble)
+        act = actions[min(len(calls), len(actions)) - 1]
+        ret = act(Path(executor._root)) or {}
+        if executor._index_file.exists():
+            idx = json.loads(executor._index_file.read_text())
+            for s in idx["steps"]:
+                if s["step"] == step["step"]:
+                    s["status"] = status
+                    s.update(extra)
+            executor._index_file.write_text(json.dumps(idx, ensure_ascii=False))
+        return ret
+
+    executor._invoke_claude = fake_invoke
+    return calls
+
+
+def _write(root, rel, text):
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+
+
+def _seed(g, root, files):
+    for rel, text in files.items():
+        _write(root, rel, text)
+    g("add", "-A")
+    g("commit", "-q", "-m", "seed")
+
+
+def _step2_now(executor):
+    return json.loads(executor._index_file.read_text())["steps"][2]
+
+
+def _run_step(executor):
+    with pytest.raises(SystemExit) as e:
+        executor._execute_single_step({"step": 2, "name": "ui"}, "")
+    return e.value.code
+
+
+class TestSessionCommitDetected:
+    """세션이 커밋하거나 브랜치를 바꾸면 재시도 없이 error. 세션 커밋은 되돌리지 않는다."""
+
+    def _commit_in_session(self, g):
+        def act(root):
+            _write(root, "src/A.java", "class A {}\n")
+            g("add", "src/A.java")
+            g("commit", "-q", "-m", "session commit")
+        return act
+
+    def test_commit_is_error_without_retry_or_build(self, executor, git_repo, tmp_project):
+        before = git_repo("rev-parse", "HEAD").strip()
+        calls = _session_acts(executor, [self._commit_in_session(git_repo)], "completed", summary="UI")
+        executor._build_cmd = "touch build-ran"
+        assert _run_step(executor) == 1
+        assert len(calls) == 1
+        assert not (tmp_project / "build-ran").exists()
+        s = _head_step2(git_repo)
+        assert s["status"] == "error"
+        assert s["error_message"].startswith("세션이 커밋함")
+        assert before in s["error_message"]
+        assert "summary" not in s
+        subjects = git_repo("log", "--format=%s").splitlines()
+        assert subjects[0] == f"{SUCCESS_MSG} 실패 기록"
+        assert "session commit" in subjects  # 되돌리지 않는다
+
+    def test_blocked_and_commit_is_error(self, executor, git_repo):
+        _session_acts(executor, [self._commit_in_session(git_repo)], "blocked", blocked_reason="API 키")
+        executor._build_cmd = "true"
+        assert _run_step(executor) == 1
+        s = _head_step2(git_repo)
+        assert s["status"] == "error"
+        assert "세션이 커밋함" in s["error_message"] and "API 키" in s["error_message"]
+
+    def test_timeout_and_commit_reports_both(self, executor, git_repo):
+        commit = self._commit_in_session(git_repo)
+
+        def act(root):
+            commit(root)
+            return {"timedOut": True}
+
+        _session_acts(executor, [act], "completed")
+        executor._build_cmd = "true"
+        assert _run_step(executor) == 1
+        msg = _head_step2(git_repo)["error_message"]
+        assert "세션 시간 초과" in msg and "세션이 커밋함" in msg
+
+    def test_amend_is_detected_as_head_change(self, executor, git_repo):
+        _session_acts(executor, [lambda root: git_repo("commit", "-q", "--amend", "--allow-empty", "-m", "rewritten")])
+        executor._build_cmd = "true"
+        assert _run_step(executor) == 1
+        assert "HEAD 가 바뀜" in _head_step2(git_repo)["error_message"]
+
+    def test_branch_switch_is_error_and_records_nothing(self, executor, git_repo, capsys):
+        _session_acts(executor, [lambda root: git_repo("switch", "-q", "-c", "other")])
+        executor._build_cmd = "touch build-ran"
+        head_other = git_repo("rev-parse", "HEAD").strip()
+        assert _run_step(executor) == 1
+        assert "세션이 브랜치를 바꿈" in capsys.readouterr().out
+        assert git_repo("rev-parse", "--abbrev-ref", "HEAD").strip() == "other"
+        assert git_repo("rev-parse", "HEAD").strip() == head_other  # 상태 커밋을 하지 않았다
+
+    def test_switch_to_branch_without_phase_dir_does_not_crash(self, executor, git_repo, capsys):
+        _session_acts(executor, [lambda root: git_repo("switch", "-q", "--orphan", "empty")])
+        executor._build_cmd = "true"
+        assert _run_step(executor) == 1
+        assert "세션이 브랜치를 바꿈" in capsys.readouterr().out
+        assert not executor._index_file.exists()  # 엉뚱한 브랜치 트리에 phases 파일을 만들지 않았다
+
+    def test_recovery_rerun_continues_on_session_commit(self, executor, git_repo):
+        """복구: error 뒤 pending 으로 바꿔 재실행하면 트리가 깨끗해 트리 검사를 지나고, 세션 커밋 위에서 이어 돈다."""
+        _session_acts(executor, [self._commit_in_session(git_repo)], "completed", summary="UI")
+        executor._build_cmd = "true"
+        assert _run_step(executor) == 1
+        session_commit = git_repo("rev-parse", "HEAD~1").strip()
+
+        idx = json.loads(executor._index_file.read_text())
+        idx["steps"][2]["status"] = "pending"
+        idx["steps"][2].pop("error_message", None)
+        executor._index_file.write_text(json.dumps(idx, ensure_ascii=False))
+        executor._check_clean_tree()  # phases/ 밖 변경이 없어 멈추지 않는다
+
+        _session_acts(executor, [lambda root: _write(root, "src/B.java", "class B {}\n")], "completed", summary="UI")
+        assert executor._execute_single_step({"step": 2, "name": "ui"}, "") is True
+        git_repo("merge-base", "--is-ancestor", session_commit, "HEAD")  # check=True — 조상이 아니면 실패
+
+
+TEST_SRC = "src/test/java/app/FooTest.java"
+FOO_TEST = "class FooTest {\n    @Test\n    void a() {}\n\n    @Test\n    void b() {}\n}\n"
+POM = "<project>\n  <properties>\n    <java.version>17</java.version>\n  </properties>\n</project>\n"
+GRADLE = "plugins { id 'java' }\n\ndependencies {\n}\n"
+
+
+class TestCriteriaWarnings:
+    """판정 기준을 바꾸는 변경을 step 항목 criteria_warnings 에 적는다. 완료 판정은 그대로."""
+
+    @pytest.fixture
+    def seeded(self, executor, git_repo, tmp_project):
+        _seed(git_repo, tmp_project, {TEST_SRC: FOO_TEST, "pom.xml": POM, "build.gradle": GRADLE})
+        executor._build_cmd = "true"
+        return git_repo
+
+    def _complete(self, executor, *actions):
+        _session_acts(executor, list(actions), "completed", summary="UI")
+        assert executor._execute_single_step({"step": 2, "name": "ui"}, "") is True
+        s = _step2_now(executor)
+        assert s["status"] == "completed"
+        return s.get("criteria_warnings")
+
+    def test_deleted_test_file_warns(self, executor, seeded, tmp_project, capsys):
+        w = self._complete(executor, lambda root: (root / TEST_SRC).unlink(missing_ok=True))
+        assert w and any("테스트 파일 삭제" in x and TEST_SRC in x for x in w)
+        assert "판정 기준 변경" in capsys.readouterr().out
+
+    def test_deleted_hangul_test_file_shown_unquoted(self, executor, seeded, tmp_project):
+        rel = "src/test/java/app/한글Test.java"
+        _seed(seeded, tmp_project, {rel: FOO_TEST.replace("FooTest", "HanTest")})
+        w = self._complete(executor, lambda root: (root / rel).unlink())
+        assert w and any(rel in x for x in w)
+
+    def test_renamed_test_file_does_not_warn(self, executor, seeded, tmp_project):
+        def act(root):
+            (root / TEST_SRC).rename(root / "src/test/java/app/BarTest.java")
+        assert self._complete(executor, act) is None
+
+    @pytest.mark.parametrize("line", ["    @Disabled", "    @Disabled(\"flaky\")", "    @Ignore",
+                                      "    @DisabledOnOs(OS.WINDOWS)", "    @Test @Disabled"])
+    def test_added_disable_annotation_warns(self, executor, seeded, tmp_project, line):
+        new = FOO_TEST.replace("    @Test\n    void a()", f"{line}\n    @Test\n    void a()")
+        w = self._complete(executor, lambda root: _write(root, TEST_SRC, new))
+        assert w and any("테스트 비활성화" in x and TEST_SRC in x for x in w)
+
+    def test_new_test_file_with_disabled_warns(self, executor, seeded, tmp_project):
+        rel = "src/test/java/app/NewTest.java"
+        w = self._complete(executor, lambda root: _write(root, rel, "class NewTest {\n  @Disabled\n  @Test void x() {}\n}\n"))
+        assert w and any(rel in x for x in w)
+
+    @pytest.mark.parametrize("line", ["    // @Disabled", "    /* @Disabled */", "     * @Disabled 는 쓰지 않는다"])
+    def test_commented_annotation_does_not_warn(self, executor, seeded, tmp_project, line):
+        new = FOO_TEST.replace("    @Test\n    void a()", f"{line}\n    @Test\n    void a()")
+        assert self._complete(executor, lambda root: _write(root, TEST_SRC, new)) is None
+
+    def test_moved_annotation_does_not_warn(self, executor, seeded, tmp_project):
+        _seed(seeded, tmp_project, {TEST_SRC: FOO_TEST.replace("    @Test\n    void a()", "    @Disabled\n    @Test\n    void a()")})
+        moved = FOO_TEST.replace("    @Test\n    void b()", "    @Disabled\n    @Test\n    void b()")
+        assert self._complete(executor, lambda root: _write(root, TEST_SRC, moved)) is None
+
+    def test_annotation_outside_test_sources_does_not_warn(self, executor, seeded, tmp_project):
+        assert self._complete(executor, lambda root: _write(root, "src/main/java/app/Entity.java",
+                                                            "class Entity {\n  @Ignore\n  int x;\n}\n")) is None
+
+    @pytest.mark.parametrize("rel,old,new", [
+        ("pom.xml", "<java.version>17</java.version>", "<java.version>17</java.version>\n    <skipTests>true</skipTests>"),
+        ("pom.xml", "<java.version>17</java.version>", "<java.version>17</java.version>\n    <maven.test.skip>true</maven.test.skip>"),
+        ("pom.xml", "<java.version>17</java.version>", "<java.version>17</java.version>\n    <testFailureIgnore>true</testFailureIgnore>"),
+        ("build.gradle", "dependencies {", "test { enabled = false }\n\ndependencies {"),
+        ("build.gradle", "dependencies {", "test {\n    ignoreFailures = true\n}\n\ndependencies {"),
+        ("build.gradle", "dependencies {", "tasks.named('build') { dependsOn 'assemble' } // -x test\n\ndependencies {"),
+    ])
+    def test_build_file_test_skip_warns(self, executor, seeded, tmp_project, rel, old, new):
+        text = (tmp_project / rel).read_text().replace(old, new)
+        w = self._complete(executor, lambda root: _write(root, rel, text))
+        assert w and any("빌드 파일" in x and rel in x for x in w)
+
+    def test_skip_tests_false_does_not_warn(self, executor, seeded, tmp_project):
+        text = POM.replace("<java.version>17</java.version>", "<java.version>17</java.version>\n    <skipTests>false</skipTests>")
+        assert self._complete(executor, lambda root: _write(root, "pom.xml", text)) is None
+
+    def test_build_file_unrelated_change_does_not_warn(self, executor, seeded, tmp_project):
+        text = GRADLE.replace("dependencies {\n", "dependencies {\n    implementation 'x:y:1'\n")
+        assert self._complete(executor, lambda root: _write(root, "build.gradle", text)) is None
+
+    @pytest.mark.parametrize("rel", ["CLAUDE.md", ".claude/settings.json", "sub/CLAUDE.md"])
+    def test_rule_file_change_warns(self, executor, seeded, tmp_project, rel):
+        w = self._complete(executor, lambda root: _write(root, rel, "changed\n"))
+        assert w and any("규칙 파일 변경" in x and rel in x for x in w)
+
+    def test_no_change_has_no_field_even_if_session_planted_one(self, executor, seeded):
+        _session_acts(executor, [lambda root: None], "completed", summary="UI", criteria_warnings=["심은 값"])
+        assert executor._execute_single_step({"step": 2, "name": "ui"}, "") is True
+        assert "criteria_warnings" not in _step2_now(executor)
+
+    def test_retry_counts_inherited_change_once(self, executor, seeded, tmp_project):
+        executor._build_cmd = "test -f marker || { touch marker; exit 1; }"
+        w = self._complete(executor, lambda root: (root / TEST_SRC).unlink(missing_ok=True), lambda root: None)
+        assert w is not None and len([x for x in w if TEST_SRC in x]) == 1
+
+    def test_retry_that_restores_test_clears_field(self, executor, seeded, tmp_project):
+        executor._build_cmd = "test -f marker || { touch marker; exit 1; }"
+        w = self._complete(executor, lambda root: (root / TEST_SRC).unlink(missing_ok=True),
+                           lambda root: _write(root, TEST_SRC, FOO_TEST))
+        assert w is None
+
+    def test_warning_recorded_on_final_failure_too(self, executor, seeded, tmp_project):
+        _session_acts(executor, [lambda root: (root / TEST_SRC).unlink(missing_ok=True)], "completed")
+        executor._build_cmd = "exit 1"
+        assert _run_step(executor) == 1
+        s = _head_step2(seeded)
+        assert s["status"] == "error" and s.get("criteria_warnings")
+
+    def test_scan_leaves_real_index_and_tree_alone(self, executor, seeded, tmp_project):
+        base = seeded("rev-parse", "HEAD").strip()
+        (tmp_project / TEST_SRC).unlink()
+        _write(tmp_project, "src/main/java/app/Staged.java", "class Staged {}\n")
+        seeded("add", "src/main/java/app/Staged.java")
+        _write(tmp_project, "src/main/java/app/Untracked.java", "class U {}\n")
+        cached, status = seeded("diff", "--cached", "--name-only"), seeded("status", "--porcelain", "-uall")
+        w = executor._scan_criteria(base)
+        assert any(TEST_SRC in x for x in w)
+        assert seeded("diff", "--cached", "--name-only") == cached
+        assert seeded("status", "--porcelain", "-uall") == status
+
+    def test_scan_outside_git_returns_empty(self, executor):
+        assert executor._scan_criteria(None) == []
+
+
+class TestSessionCheckEdgeCases:
+    """코덱스 검수 반영: 깨진 index·임시 파일 오류·빌드가 HEAD 를 바꾼 경우."""
+
+    def test_violation_with_broken_index_still_records_error(self, executor, git_repo):
+        def act(root):
+            _write(root, "src/A.java", "class A {}\n")
+            git_repo("add", "src/A.java")
+            git_repo("commit", "-q", "-m", "session commit")
+            executor._index_file.write_text('{"steps": null}')
+
+        executor._invoke_claude = lambda step, preamble: act(Path(executor._root)) or {}
+        executor._build_cmd = "true"
+        assert _run_step(executor) == 1
+        s = _head_step2(git_repo)
+        assert s["status"] == "error" and "세션이 커밋함" in s["error_message"]
+
+    def test_scan_temp_file_error_does_not_block(self, executor, git_repo, capsys):
+        with patch("tempfile.mkstemp", side_effect=OSError("디스크 가득")):
+            assert executor._scan_criteria(git_repo("rev-parse", "HEAD").strip()) == []
+        assert "판정 기준 검사 실패" in capsys.readouterr().out
+
+    def test_head_moved_by_build_is_not_blamed_on_next_session(self, executor, git_repo):
+        # 첫 빌드가 (잘못 만든 빌드 스크립트로) 커밋하고 실패 → 다음 시도의 세션은 커밋하지 않았다.
+        executor._build_cmd = ("test -f marker || { touch marker; git commit -q --allow-empty -m build-commit; exit 1; }")
+        _session_acts(executor, [lambda root: None], "completed", summary="UI")
+        assert executor._execute_single_step({"step": 2, "name": "ui"}, "") is True
+
+
+class TestSessionCheckFailures:
+    """관찰용 검사의 예외·HEAD 삭제·브랜치 전환 뒤 출력 저장이 본 흐름을 끊거나 다른 브랜치를 건드리지 않는다."""
+
+    @pytest.mark.parametrize("exc", [
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        OSError("임시 index 를 지우지 못함"),
+    ], ids=["unicode", "oserror"])
+    def test_scan_exception_does_not_block_completion(self, executor, exc, capsys):
+        _session_acts(executor, [lambda root: None], "completed", summary="UI")
+        executor._commit_step = MagicMock()
+        executor._scan_criteria = MagicMock(side_effect=exc)
+        executor._build_cmd = "true"
+        assert executor._execute_single_step({"step": 2, "name": "ui"}, "") is True
+        assert _step2_now(executor)["status"] == "completed"
+        assert "판정 기준 검사 실패" in capsys.readouterr().out
+
+    def test_scan_exception_does_not_block_failure_record(self, executor):
+        _session_acts(executor, [lambda root: None], "completed", summary="UI")
+        executor._commit_state = MagicMock()
+        executor._scan_criteria = MagicMock(side_effect=OSError("임시 index 를 지우지 못함"))
+        executor._build_cmd = "exit 1"
+        assert _run_step(executor) == 1
+        assert _step2_now(executor)["status"] == "error"
+        executor._commit_state.assert_called_once()
+
+    def test_head_deleted_on_same_branch_is_violation(self, executor):
+        msg = executor._session_git_violation(("a" * 40, "main"), (None, "main"))
+        assert msg is not None and "HEAD 가 사라짐" in msg
+
+    def test_head_deleted_in_session_records_error(self, executor, git_repo):
+        _session_acts(executor, [lambda root: git_repo("update-ref", "-d", "refs/heads/main")])
+        executor._build_cmd = "true"
+        assert _run_step(executor) == 1
+        s = _step2_now(executor)
+        assert s["status"] == "error" and "HEAD 가 사라짐" in s["error_message"]
+
+    def test_branch_switch_does_not_write_output_on_other_branch(self, executor, git_repo, tmp_project, monkeypatch, capsys):
+        bin_dir = tmp_project / "bin"
+        bin_dir.mkdir()
+        script = bin_dir / "claude"
+        script.write_text(f"#!{sys.executable}\nimport subprocess\n"
+                          f"subprocess.run(['git', 'switch', '-q', '-c', 'other'], cwd={str(tmp_project)!r}, check=True)\n")
+        script.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+        executor._build_cmd = "true"
+        assert _run_step(executor) == 1
+        assert git_repo("rev-parse", "--abbrev-ref", "HEAD").strip() == "other"
+        assert not (executor._phase_dir / "step2-output.json").exists()
+        assert "세션이 브랜치를 바꿈" in capsys.readouterr().out

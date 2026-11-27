@@ -91,6 +91,8 @@
 
 `created_at`은 execute.py가 최초 실행 시 task 레벨에 한 번만 기록한다. step 레벨의 `started_at`도 execute.py가 각 step 시작 시 자동 기록한다. 생성 시 넣지 않는다.
 
+`criteria_warnings`는 execute.py가 step에 기록하는 판정 기준 변경 경고 목록이다(E절 참조). 경고가 없으면 필드를 지우고, 세션이 적은 값은 덮어쓴다. 생성 시 넣지 않는다.
+
 #### D-3. `phases/{ticket}/step{N}.md` (각 step마다 1개)
 
 ```markdown
@@ -154,6 +156,8 @@ execute.py가 자동으로 처리하는 것:
 - 자가 교정 — 실패 시 최대 3회 재시도하며, 이전 에러 메시지를 프롬프트에 피드백
 - 완료 검증 — 세션이 `completed`를 적으면 `## 명령어`의 빌드 커맨드를 직접 돌려 exit 0일 때만 완료로 확정. 실패는 재시도 1회로 세고, 빌드 시간 초과(30분)는 재시도 없이 error. 세션 시간 초과(30분)도 세션 프로세스를 끝내고 재시도 없이 error
 - 2단계 커밋 — 세션에는 커밋하지 말라고 지시하고, 빌드를 통과한 step만 코드 변경과 메타데이터(`phases/` 상태 파일)를 분리 커밋. error·blocked로 끝난 step은 `phases/` 상태 파일만 커밋하고(`step {N} {name} 실패 기록`·`step {N} {name} 중단 기록`), 빌드를 통과하지 않은 코드는 커밋하지 않고 작업 트리에 남긴다
+- 세션 커밋 감지 — 시도마다 세션 앞뒤의 HEAD·브랜치를 비교한다. 세션이 커밋했거나 HEAD를 바꿨으면 빌드를 돌리지 않고 재시도 없이 error로 끝낸다. 세션이 만든 커밋은 되돌리지 않고 그대로 둔다. 세션이 브랜치를 바꿨으면 상태 파일·커밋에 기록하지 않고 돌아갈 `git switch` 명령을 안내한 뒤 멈춘다
+- 판정 기준 변경 경고 — 세션 뒤 변경분(step 시작 HEAD 대비 작업 트리 전체)에서 판정 기준을 바꾸는 변경을 찾아 step의 `criteria_warnings`와 화면에 남긴다. 막지 않는다 — 완료 판정은 그대로다. 찾는 것: 테스트 파일 삭제·테스트 경로 밖 이동, 테스트에 새로 붙은 `@Disabled`·`@Ignore`, 빌드 파일에 새로 들어간 테스트 생략 설정, `CLAUDE.md`·`.claude/` 변경. 정규식 수준 관찰이라 오탐·누락이 있다
 - 타임스탬프 — started_at, completed_at, failed_at, blocked_at 자동 기록
 
 빌드는 execute.py를 띄운 셸의 환경으로 돈다. `JAVA_HOME`처럼 빌드에 필요한 환경변수를 그 셸에 먼저 설정하라. 없으면 빌드가 시간 초과까지 매달릴 수 있다.
@@ -163,4 +167,7 @@ execute.py가 자동으로 처리하는 것:
 - **error 발생 시**: 작업 트리에 남은 `phases/` 밖 변경(미추적 파일 포함, 재실행하면 execute.py가 목록을 보이고 멈춘다)을 커밋·stash·폐기 중 하나로 먼저 정리한다. 그다음 phase 브랜치에서 `phases/{ticket}/index.json`의 해당 step `status`를 `"pending"`으로 바꾸고 `error_message`를 삭제한 뒤 재실행한다.
 - **blocked 발생 시**: `blocked_reason`에 적힌 사유를 해결하고 error 때와 같이 남은 변경을 정리한 뒤, phase 브랜치에서 `status`를 `"pending"`으로 바꾸고 `blocked_reason`을 삭제한 뒤 재실행한다.
 - 남은 변경을 정리할 때 `phases/` 아래 파일은 치우지 마라. 이유: 아직 커밋되지 않은 `step{N}.md`가 `git stash -u`·`git clean`으로 사라지면 재실행이 step 파일을 찾지 못해 멈춘다. stash는 `git stash push -u -- <phases/ 밖 경로>`처럼 경로를 지정한다.
+- **`error_message`가 「세션이 커밋함」으로 시작하는 error**: `error_message`의 `HEAD <이전 HEAD> → <세션 뒤 HEAD>`에서 이전 HEAD를 확인하고 `git log <이전 HEAD>..HEAD`로 세션이 만든 커밋을 본다. 그 커밋을 남길지 `git reset --soft <이전 HEAD>`로 풀지 정한다. 풀면 execute.py의 「실패 기록」 커밋도 함께 풀린다. 풀었으면 위 error 절차(남은 변경 정리 → `"pending"` → 재실행)로 이어간다.
+- **「세션이 브랜치를 바꿈」을 출력하고 멈춘 경우**: execute.py는 상태 파일·커밋에 기록하지 않는다. 화면에 안내된 `git switch …` 명령으로 돌아가 남은 변경을 정리한 뒤 재실행한다. 돌아온 뒤 해당 step이 `error`나 `blocked`로 적혀 있으면(세션이 직접 적은 것) 사유를 확인하고 `"pending"`으로 바꾼 뒤 재실행한다.
 - **`status`를 직접 `"completed"`로 바꾼 경우**: `completed_at`이 없는 `completed`는 검증 전으로 보고 다시 실행한다.
+- `criteria_warnings`가 있는 step은 완료여도 사람이 확인한다. 이유: 경고는 완료를 막지 않는다.
