@@ -43,14 +43,20 @@ def progress_indicator(label: str):
         sys.stderr.write("\r" + " " * (len(label) + 20) + "\r")
         sys.stderr.flush()
 
-    th = threading.Thread(target=_animate, daemon=True)
-    th.start()
+    # 터미널이 아니면(파일로 돌린 로그 등) 프레임 대신 시작 줄 하나만 쓴다 — \r 이 덮어쓰지 못해 프레임마다 한 줄씩 쌓인다.
+    # 시작 줄은 결과 줄과 같은 stdout 에 flush 해 로그에서 순서가 뒤바뀌지 않게 한다.
+    th = threading.Thread(target=_animate, daemon=True) if sys.stderr.isatty() else None
+    if th:
+        th.start()
+    else:
+        print(f"  ▶ {label}", flush=True)
     info = types.SimpleNamespace(elapsed=0.0)
     try:
         yield info
     finally:
         stop.set()
-        th.join()
+        if th:
+            th.join()
         info.elapsed = time.monotonic() - t0
 
 
@@ -326,12 +332,17 @@ class StepExecutor:
         else:
             print(f"  WARN: 상태 커밋 실패: {r.stderr.strip()}")
 
+    def _add_all(self):
+        """작업 트리 전체를 stage 하되 모든 phase 의 세션 출력 파일(stepN-output.json)은 뺀다.
+        설치한 프로젝트에 무시 규칙이 없어도 커밋에 들어가지 않게 하고, 세션이 미리 stage 해 둔 것도 내린다."""
+        outputs = "phases/*/step*-output.json"
+        self._run_git("add", "-A", "--", ".", f":(exclude,glob){outputs}")
+        self._run_git("reset", "-q", "HEAD", "--", f":(glob){outputs}")
+
     def _commit_step(self, step_num: int, step_name: str):
-        output_rel = f"phases/{self._phase_dir_name}/step{step_num}-output.json"
         index_rel = f"phases/{self._phase_dir_name}/index.json"
 
-        self._run_git("add", "-A")
-        self._run_git("reset", "HEAD", "--", output_rel)
+        self._add_all()
         self._run_git("reset", "HEAD", "--", index_rel)
 
         if self._run_git("diff", "--cached", "--quiet").returncode != 0:
@@ -342,7 +353,7 @@ class StepExecutor:
             else:
                 print(f"  WARN: 코드 커밋 실패: {r.stderr.strip()}")
 
-        self._run_git("add", "-A")
+        self._add_all()
         if self._run_git("diff", "--cached", "--quiet").returncode != 0:
             msg = self._commit_msg(f"step {step_num} 산출물 기록")
             r = self._run_git("commit", "-m", msg)
@@ -611,7 +622,7 @@ class StepExecutor:
             self._session_branch = git_before[1]
             with progress_indicator(tag) as pi:
                 out = self._invoke_claude(step, preamble)
-                elapsed = int(pi.elapsed)
+            elapsed = int(pi.elapsed)
 
             git_after = self._git_state()
             violation = self._session_git_violation(git_before, git_after)
@@ -765,7 +776,7 @@ class StepExecutor:
         self._write_json(self._index_file, index)
         self._update_top_index("completed")
 
-        self._run_git("add", "-A")
+        self._add_all()
         if self._run_git("diff", "--cached", "--quiet").returncode != 0:
             msg = self._commit_msg("phase 완료")
             r = self._run_git("commit", "-m", msg)

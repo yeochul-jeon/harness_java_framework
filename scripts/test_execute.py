@@ -492,6 +492,94 @@ class TestProgressIndicator:
             time.sleep(0.2)
         assert pi.elapsed > 0
 
+    def test_no_frames_when_stderr_is_not_a_terminal(self, monkeypatch):
+        import io, time
+        buf = io.StringIO()
+        monkeypatch.setattr(sys, "stderr", buf)
+        with ex.progress_indicator("test"):
+            time.sleep(0.4)
+        assert "\r" not in buf.getvalue()
+
+    def test_frames_when_stderr_is_a_terminal(self, monkeypatch):
+        import io, time
+
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+
+        buf = Tty()
+        monkeypatch.setattr(sys, "stderr", buf)
+        with ex.progress_indicator("test"):
+            assert _wait_until(lambda: buf.getvalue().count("\r") >= 2, 5)
+        assert "test [" in buf.getvalue()  # 경과 초 값은 스레드 시작 시점에 따라 달라 보지 않는다
+
+    def test_start_line_on_stdout_when_not_a_terminal(self, capsys):
+        with ex.progress_indicator("Step 2/2 (2 done): ui"):
+            pass
+        out, err = capsys.readouterr()
+        assert out == "  ▶ Step 2/2 (2 done): ui\n"
+        assert err == ""
+
+    def test_no_start_line_when_a_terminal(self, monkeypatch, capsys):
+        import io
+
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+
+        monkeypatch.setattr(sys, "stderr", Tty())
+        with ex.progress_indicator("test"):
+            pass
+        assert capsys.readouterr().out == ""
+
+    def test_start_line_each_attempt_with_retry_mark(self, executor, capsys):
+        _session_does(executor, "completed", summary="UI 완료")
+        executor._commit_step = MagicMock()
+        executor._build_cmd = "test -f marker || { touch marker; exit 1; }"
+        assert executor._execute_single_step({"step": 2, "name": "ui"}, "") is True
+        starts = [l for l in capsys.readouterr().out.splitlines() if l.startswith("  ▶ ")]
+        assert len(starts) == 2
+        assert starts[0].endswith(": ui")
+        assert starts[1].endswith(": ui [retry 2/3]")
+
+
+class TestStepElapsedShown:
+    """결과 줄의 소요 시간은 세션이 끝난 뒤 진행 표시기가 잰 값이다."""
+
+    @pytest.fixture(autouse=True)
+    def _indicator_measures_42s(self, monkeypatch):
+        import contextlib, types
+
+        @contextlib.contextmanager
+        def fake(label):
+            info = types.SimpleNamespace(elapsed=0.0)
+            try:
+                yield info
+            finally:
+                info.elapsed = 42.0  # 실제 표시기처럼 블록이 끝날 때 채운다
+
+        monkeypatch.setattr(ex, "progress_indicator", fake)
+
+    def test_completed_line(self, executor, capsys):
+        _session_does(executor, "completed", summary="UI 완료")
+        executor._commit_step = MagicMock()
+        executor._build_cmd = "true"
+        assert executor._execute_single_step({"step": 2, "name": "ui"}, "") is True
+        assert "✓ Step 2: ui [42s]" in capsys.readouterr().out
+
+    def test_blocked_line(self, executor, capsys):
+        _session_does(executor, "blocked", blocked_reason="키 없음")
+        executor._commit_state = MagicMock()
+        assert _run_step(executor) == 2
+        assert "⏸ Step 2: ui blocked [42s]" in capsys.readouterr().out
+
+    def test_failed_line(self, executor, capsys):
+        _session_does(executor, "completed", summary="UI 완료")
+        executor._commit_state = MagicMock()
+        executor._build_cmd = "exit 1"
+        assert _run_step(executor) == 1
+        assert f"failed after {ex.StepExecutor.MAX_RETRIES} attempts [42s]" in capsys.readouterr().out
+
 
 # ---------------------------------------------------------------------------
 # main() CLI 파싱 (mocked)
@@ -1735,3 +1823,59 @@ class TestSessionCheckFailures:
         assert git_repo("rev-parse", "--abbrev-ref", "HEAD").strip() == "other"
         assert not (executor._phase_dir / "step2-output.json").exists()
         assert "세션이 브랜치를 바꿈" in capsys.readouterr().out
+
+
+class TestSessionOutputNotCommitted:
+    """세션 출력 파일(stepN-output.json)은 무시 규칙이 있든 없든 실행기가 만드는 커밋에 들어가지 않는다."""
+
+    IGNORE = "phases/**/step*-output.json\n"
+
+    def _repo(self, tmp_project, monkeypatch, ignore):
+        if ignore:
+            (tmp_project / ".gitignore").write_text(self.IGNORE)
+        return _git_init(tmp_project, monkeypatch, ".")
+
+    def _step2_done(self, executor, tmp_project, g):
+        """step 2 를 마친 직후 모습: 코드·index 변경, 앞 step 과 이번 step 의 출력 파일, 세션이 해 둔 git add -A."""
+        _write(tmp_project, "src/Ui.java", "class Ui {}\n")
+        (executor._phase_dir / "step1-output.json").write_text("{}")
+        (executor._phase_dir / "step2-output.json").write_text("{}")
+        other = tmp_project / "phases" / "ABC-5678"  # 무시 규칙 없는 저장소에서 앞서 끝난 다른 phase
+        other.mkdir()
+        (other / "step0-output.json").write_text("{}")
+        idx = json.loads(executor._index_file.read_text())
+        idx["steps"][2]["status"] = "completed"
+        executor._index_file.write_text(json.dumps(idx, ensure_ascii=False))
+        g("add", "-A")
+
+    @staticmethod
+    def _subjects(g):
+        return g("log", "--format=%s").splitlines()
+
+    @pytest.mark.parametrize("ignore", [True, False], ids=["ignore-rule", "no-ignore-rule"])
+    def test_step_commits(self, executor, tmp_project, monkeypatch, ignore):
+        g = self._repo(tmp_project, monkeypatch, ignore)
+        self._step2_done(executor, tmp_project, g)
+        executor._commit_step(2, "ui")
+        subjects = self._subjects(g)
+        assert SUCCESS_MSG in subjects
+        assert "[ABC-1234] step 2 산출물 기록" in subjects
+        committed = _committed_files(g)
+        assert "src/Ui.java" in committed
+        assert "phases/ABC-1234/index.json" in committed
+        assert "phases/ABC-1234/step1-output.json" not in committed
+        assert "phases/ABC-1234/step2-output.json" not in committed
+        assert "phases/ABC-5678/step0-output.json" not in committed
+        assert (executor._phase_dir / "step2-output.json").exists()
+
+    @pytest.mark.parametrize("ignore", [True, False], ids=["ignore-rule", "no-ignore-rule"])
+    def test_phase_done_commit(self, executor, tmp_project, monkeypatch, ignore):
+        g = self._repo(tmp_project, monkeypatch, ignore)
+        self._step2_done(executor, tmp_project, g)
+        executor._finalize()
+        assert self._subjects(g)[0] == "[ABC-1234] phase 완료"
+        committed = _committed_files(g)
+        assert "src/Ui.java" in committed
+        assert "phases/ABC-1234/step1-output.json" not in committed
+        assert "phases/ABC-1234/step2-output.json" not in committed
+        assert "phases/ABC-5678/step0-output.json" not in committed

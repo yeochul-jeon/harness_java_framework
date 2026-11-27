@@ -39,6 +39,13 @@ cp -r harness_java_framework/scripts   my-project/
 cp    harness_java_framework/CLAUDE.md my-project/
 ```
 
+`execute.py`는 step마다 세션의 전체 응답을 `phases/{ticket}/step{N}-output.json`에 남긴다. 이 파일은 커밋하지 않는다.
+`git status`에 계속 보이지 않게 하려면 프로젝트의 `.gitignore`에 아래 줄을 넣는다.
+
+```
+phases/**/step*-output.json
+```
+
 ## 설정
 
 프로젝트에서 Claude Code를 열고 **한 번만** 실행한다.
@@ -120,6 +127,21 @@ Claude가 응답을 끝낼 때마다 프로젝트 루트에서 컴파일 커맨�
 ```
 
 자세한 내용은 `docs/GIT.md` 참조.
+
+## 검증한 범위
+
+Gradle(8.2.1 wrapper) + Spring Boot 3.1.3 + JDK 17 샘플 프로젝트에서 실제 `claude -p` 세션으로 돌려 확인했다.
+
+- 확인함
+  - step 성공 뒤 빌드 재실행, 코드·메타 분리 커밋
+  - 세션이 blocked를 적었을 때의 중단 기록과 exit 2, 복구 절차 뒤 재실행과 phase 완료
+  - 세션이 error를 적었을 때 3회 시도 뒤 실패 기록과 exit 1, 통과하지 않은 코드가 커밋되지 않고 작업 트리에 남는 것
+  - step 세션이 끝날 때마다 컴파일 검증 hook이 도는 것
+- 확인하지 않음
+  - 세션은 완료라고 적었는데 `execute.py`의 빌드가 실패하는 경우
+  - 세션 시간 초과, 세션이 커밋한 경우
+  - 컴파일 검증 hook의 차단 (컴파일이 깨진 적이 없었다)
+  - Maven 프로젝트, `/bootstrap`
 
 ## 프레임워크 자체 테스트
 
