@@ -82,6 +82,11 @@ class StepExecutor:
         r"|testFailureIgnore\s*(>|=)\s*true|ignoreFailures\s*=\s*true|\benabled\s*=\s*false"
         r"|-x\s+test\b|--exclude-task[=\s]+test\b"
     )
+    # 세션 권한: acceptEdits 가 프로젝트 안 편집·파일 명령을 자동 승인하고, --permission-prompts none 이 승인이
+    # 필요한 나머지 호출(프로젝트 밖 쓰기·git commit 등)을 묻지 않고 거부한다. 허용 목록은 빌드 래퍼만 더한다.
+    DEFAULT_ALLOWED_TOOLS = ["Bash(./gradlew *)", "Bash(./mvnw *)"]
+    MIN_CLAUDE_VERSION = "v2.1.259"  # --permission-prompts 를 처음 지원한 판(CLI 문서)
+    DENIAL_ITEM_MAX = 120
     DEFAULT_BRANCH_PREFIX = "feature/"
     DEFAULT_COMMIT_FORMAT = "[{ticket}] {message}"
     TZ = timezone(timedelta(hours=9))
@@ -94,6 +99,7 @@ class StepExecutor:
         self._top_index_file = self._phases_dir / "index.json"
         self._auto_push = auto_push
         self._session_branch = self._UNCHECKED  # 세션 직전 브랜치 — 세션이 브랜치를 바꿨으면 출력을 저장하지 않는다.
+        self._allowed_tools = list(self.DEFAULT_ALLOWED_TOOLS)  # run() 이 checkout 뒤 phase 값을 더해 다시 정한다.
 
         if not self._phase_dir.is_dir():
             print(f"ERROR: {self._phase_dir} not found")
@@ -119,6 +125,8 @@ class StepExecutor:
         self._checkout_branch()
         self._check_blockers()
         self._build_cmd = self._load_build_command()
+        # 실행마다 한 번만 읽는다 — 세션이 index 에 적은 값이 이번 실행의 다음 시도·다음 step 을 넓히지 않는다.
+        self._allowed_tools = self._load_allowed_tools()
         guardrails = self._load_guardrails()
         self._ensure_created_at()
         self._execute_all_steps(guardrails)
@@ -434,6 +442,44 @@ class StepExecutor:
             print(f"  WARN: 빌드 줄에 `테스트 미실행` 표시가 있다 — AC 빌드는 테스트를 돌리지 않는다: {line}")
         return line
 
+    def _load_allowed_tools(self) -> list:
+        """기본 허용 목록 뒤에 phase index 의 선택 필드 allowed_tools(문자열 배열)를 붙인다."""
+        extra = self._read_json(self._index_file).get("allowed_tools", [])
+        if not isinstance(extra, list) or not all(isinstance(x, str) for x in extra):
+            print(f"ERROR: {self._index_file} 의 allowed_tools 는 문자열 배열이어야 한다 — 받은 값: {json.dumps(extra, ensure_ascii=False)}")
+            sys.exit(1)
+        # 빈 값·'-' 로 시작하는 값은 claude 인자 해석에서 옵션으로 읽혀 권한 플래그를 바꿀 수 있다.
+        bad = [x for x in extra if not x.strip() or x.lstrip().startswith("-")]
+        if bad:
+            print(f"ERROR: {self._index_file} 의 allowed_tools 에 빈 값이나 '-' 로 시작하는 값이 있다: {bad}")
+            sys.exit(1)
+        return self.DEFAULT_ALLOWED_TOOLS + extra
+
+    def _permission_denials(self, stdout: str) -> list:
+        """세션 출력 JSON 의 permission_denials 를 「도구: 명령 또는 경로」 요약 목록으로. 읽지 못하면 WARN 후 빈 목록.
+        tool_input 전체는 남기지 않는다 — Write 는 파일 내용을 통째로 담고, phase index 는 커밋된다.
+        관찰용 검사다 — 어떤 예외도 세션 커밋 감지·판정·빌드를 막지 않게 WARN 으로 남긴다(판정 기준 검사와 같다)."""
+        try:
+            data = json.loads(stdout)
+            denials = data["permission_denials"]
+            if not isinstance(denials, list) or not all(isinstance(d, dict) for d in denials):
+                raise TypeError("permission_denials 가 객체 배열이 아니다")
+            items = []
+            for d in denials:
+                tool = str(d.get("tool_name", "?"))
+                inp = d.get("tool_input") if isinstance(d.get("tool_input"), dict) else {}
+                target = next((inp[k] for k in ("command", "file_path", "path", "url", "pattern")
+                               if isinstance(inp.get(k), str)), "")
+                item = " ".join(f"{tool}: {target}".split()) if target else tool
+                if len(item) > self.DENIAL_ITEM_MAX:
+                    item = item[:self.DENIAL_ITEM_MAX - 1] + "…"
+                # JSON 의 단독 서로게이트(\ud800 등)는 UTF-8 로 쓸 수 없다 — 출력 파일·index 쓰기가 끊기지 않게 바꾼다.
+                items.append(item.encode("utf-8", "replace").decode("utf-8"))
+            return items
+        except Exception as e:
+            print(f"  WARN: 권한 거부 기록을 읽지 못했다 — {type(e).__name__}: {e}")
+            return []
+
     @staticmethod
     def _build_step_context(index: dict) -> str:
         lines = [
@@ -466,7 +512,9 @@ class StepExecutor:
             f"   - AC 통과 → \"completed\" + \"summary\" 필드에 이 step의 산출물을 한 줄로 요약\n"
             f"   - {self.MAX_RETRIES}회 수정 시도 후에도 실패 → \"error\" + \"error_message\" 기록\n"
             f"   - 사용자 개입이 필요한 경우 (API 키, 인증, 수동 설정 등) → \"blocked\" + \"blocked_reason\" 기록 후 즉시 중단\n"
-            f"6. 커밋하지 마라. 실행기가 AC 빌드를 다시 돌려 통과하면 커밋한다.\n\n---\n\n"
+            f"6. 커밋하지 마라. 실행기가 AC 빌드를 다시 돌려 통과하면 커밋한다.\n"
+            f"7. 권한이 거부된 명령을 다른 방법으로 우회하지 마라. 거부 때문에 진행할 수 없으면 \"blocked\" + "
+            f"\"blocked_reason\" 에 거부된 명령을 적어라.\n\n---\n\n"
         )
 
     # --- Claude 호출 ---
@@ -482,7 +530,10 @@ class StepExecutor:
         prompt = preamble + step_file.read_text()
         # 세션이 띄운 빌드·셸이 시간 초과 뒤에도 남지 않게 별도 프로세스 그룹으로 띄운다(_run_build 와 같은 이유).
         proc = subprocess.Popen(
-            ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
+            # --allowedTools 는 값을 여럿 받는다 — 다음 옵션(--output-format)이 목록을 끝내므로 순서를 바꾸지 않는다.
+            ["claude", "-p", "--permission-mode", "acceptEdits", "--permission-prompts", "none",
+             "--allowedTools", *self._allowed_tools,
+             "--output-format", "json", prompt],
             cwd=self._root, start_new_session=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -515,6 +566,9 @@ class StepExecutor:
             "step": step_num, "name": step_name,
             "exitCode": proc.returncode, "timedOut": timed_out,
             "stdout": stdout, "stderr": stderr,
+            # 시간 초과면 결과 JSON 이 없다. 인자를 모르는 옛 CLI 도 출력이 없어 읽지 않는다(_execute_single_step 이 멈춘다).
+            "permissionDenials": [] if timed_out or self._unknown_option(proc.returncode, stdout, stderr)
+                                 else self._permission_denials(stdout),
         }
         out_path = self._phase_dir / f"step{step_num}-output.json"
         switched = self._session_branch is not self._UNCHECKED and self._git_state()[1] != self._session_branch
@@ -526,6 +580,14 @@ class StepExecutor:
             json.dump(output, f, indent=2, ensure_ascii=False)
 
         return output
+
+    @staticmethod
+    def _unknown_option(returncode, stdout, stderr) -> Optional[str]:
+        """claude 가 호출 인자를 몰라 시작도 못 했으면 그 stderr 줄을 돌려준다.
+        claude 의 문구(`error: unknown option '…'`)로 시작하는 줄만 본다 — 다른 프로그램의 진단은 옛 CLI 가 아니다."""
+        if returncode == 0 or (stdout or "").strip():
+            return None
+        return next((l.strip() for l in (stderr or "").splitlines() if l.startswith("error: unknown option")), None)
 
     def _run_build(self) -> Optional[str]:
         """빌드 커맨드를 돌린다. 통과면 None, 실패·시간 초과면 다음 시도에 넘길 에러 문구."""
@@ -608,8 +670,10 @@ class StepExecutor:
         # 판정 기준 경고는 step 시작 HEAD 대비 누적 변경으로 본다.
         step_base = self._git_state()[0]
 
+        no_field = object()
         for attempt in range(1, self.MAX_RETRIES + 1):
             index = self._read_json(self._index_file)
+            tools_before = index.get("allowed_tools", no_field)
             step_context = self._build_step_context(index)
             preamble = self._build_preamble(guardrails, step_context, prev_error)
 
@@ -631,6 +695,14 @@ class StepExecutor:
                 print(f"  ✗ Step {step_num}: {step_name} — {violation}")
                 back = git_before[1] or f"--detach {git_before[0]}"
                 print(f"    index·커밋에 기록하지 않았다. `git switch {back}` 로 돌아가 정리한 뒤 다시 실행하라.")
+                sys.exit(1)
+
+            bad_cli = None if out.get("timedOut") or violation else self._unknown_option(
+                out.get("exitCode"), out.get("stdout"), out.get("stderr"))
+            if bad_cli:
+                # 세션이 시작도 못 했다 — 환경 문제라 재시도해도 같다. step 상태는 건드리지 않는다(올린 뒤 그대로 다시 실행).
+                print(f"  ✗ Step {step_num}: {step_name} — 설치된 Claude Code 가 실행기 호출 인자를 모른다: {bad_cli}")
+                print(f"    `claude --version` 을 확인하고 Claude Code {self.MIN_CLAUDE_VERSION} 이상으로 올린 뒤 다시 실행하라.")
                 sys.exit(1)
 
             session_err = None
@@ -656,6 +728,15 @@ class StepExecutor:
             else:
                 index = self._read_json(self._index_file)
                 status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
+                # 세션이 자기 권한 목록을 넓혀 다음 실행에 남기지 못하게 세션 전 값으로 되돌린다(판정은 그대로).
+                # session_err 경로는 세션 전 index 를 쓰므로 따로 되돌릴 것이 없다.
+                if index.get("allowed_tools", no_field) != tools_before:
+                    if tools_before is no_field:
+                        index.pop("allowed_tools", None)
+                    else:
+                        index["allowed_tools"] = tools_before
+                    self._write_json(self._index_file, index)
+                    print("  ⚠ 세션이 allowed_tools 를 바꿨다 — 세션 전 값으로 되돌렸다")
             ts = self._stamp()
 
             # 판정 기준 변경 경고(관찰만). 세션이 이 필드를 적었어도 실행기 값으로 덮어쓴다.
@@ -673,6 +754,17 @@ class StepExecutor:
                         s.pop("criteria_warnings", None)
             if warnings:
                 print(f"  ⚠ 판정 기준 변경 {len(warnings)}건 — " + "; ".join(warnings))
+
+            # 권한 거부 내역(관찰만 — 판정은 바꾸지 않는다). 세션이 이 필드를 적었어도 실행기 값으로 덮어쓴다.
+            denials = out.get("permissionDenials") or []
+            for s in index["steps"]:
+                if s["step"] == step_num:
+                    if denials:
+                        s["permission_denials"] = denials
+                    else:
+                        s.pop("permission_denials", None)
+            if denials:
+                print(f"  ⚠ 권한 거부 {len(denials)}건 — " + "; ".join(denials))
 
             build_err = None
             if status == "completed":

@@ -16,13 +16,14 @@ Claude Code로 Java/Spring 프로젝트를 step 단위로 자동 개발하는 �
 
 세션이 커밋하거나 HEAD·브랜치를 바꾸면 `execute.py`는 그 step을 재시도 없이 멈춘다 (세션이 만든 커밋은 되돌리지 않는다).
 세션이 테스트를 지우거나 끄는 등 판정 기준을 바꾼 변경은 막지 않고 step의 `criteria_warnings`와 화면에 경고로 남긴다.
+step 세션은 프로젝트 폴더 안의 파일 편집과 `./gradlew`·`./mvnw` 실행만 허용된 상태로 돈다. 그 밖의 호출은 묻지 않고 거부되며, 거부 내역은 step의 `permission_denials`와 화면에 남는다 (아래 「step 세션의 권한」).
 
 빌드툴·Java/Spring 버전·영속성·아키텍처 패턴은 고정하지 않는다. 프로젝트마다 다르므로
 `/bootstrap`이 기존 소스를 분석해 문서를 채운다.
 
 ## 사전 요구사항
 
-- [Claude Code](https://claude.ai/code) CLI
+- [Claude Code](https://claude.ai/code) CLI v2.1.259 이상 (`execute.py`가 쓰는 권한 옵션의 최소 버전)
 - Python 3
 - jq (hook의 입력 읽기·차단 결과 출력용 — 위험 커맨드 차단, 컴파일 검증. 없으면 경고 후 검사 없이 통과)
 - Java + Spring 프로젝트 (Gradle Wrapper 또는 Maven Wrapper 포함)
@@ -104,6 +105,30 @@ scripts/
 `docs/*.md`는 **매 step 프롬프트에 전부 주입된다.** 문서를 늘릴수록 토큰을 쓰고 신호가 희석되므로
 필요한 것만 남긴다.
 
+## step 세션의 권한
+
+`execute.py`는 step 세션을 `--permission-mode acceptEdits --permission-prompts none`으로 띄운다.
+
+- 허용: 프로젝트 폴더 안의 파일 읽기·편집, 프로젝트 폴더 안의 `mkdir`·`mv`·`rm` 같은 파일 명령, 읽기 전용 명령, `./gradlew …`, `./mvnw …`
+- 거부: 프로젝트 폴더 밖 쓰기, `git commit`·`git tag` 같은 git 쓰기, `.claude/` 아래 쓰기, 그 밖에 승인이 필요한 모든 호출
+- 거부돼도 세션은 이어진다. 거부 내역은 화면의 `⚠ 권한 거부 N건` 줄과 step의 `permission_denials`에 남는다.
+  완료된 step에도 남을 수 있다 (세션이 곁다리로 쓴 `python3 -c …` 같은 명령). 완료 판정은 바꾸지 않는다.
+- step에 다른 명령이 필요하면 `phases/{ticket}/index.json`에 `allowed_tools`를 넣는다. 기본 목록 뒤에 붙는다.
+  ```json
+  "allowed_tools": ["Bash(docker compose *)", "Bash(mvn *)"]
+  ```
+  빌드 커맨드가 wrapper가 아니면(`mvn`·`gradle`) 여기에 넣어야 세션이 빌드를 직접 돌릴 수 있다.
+  세션이 이 필드를 고치면 `execute.py`가 세션 전 값으로 되돌리고 경고를 남긴다.
+
+이 제한은 실수를 막는 장치이고 격리가 아니다.
+
+- `./gradlew`·`./mvnw`를 허용하므로, 세션이 고친 빌드 스크립트가 임의 코드를 돌릴 수 있다.
+- 프로젝트 폴더 안의 파일은 무엇이든 고치거나 지울 수 있다. `scripts/execute.py`와 다른 phase의 `index.json`(`allowed_tools` 포함)도 그 안에 있다.
+  step 커밋의 변경 목록을 사람이 확인한다.
+- 사용자 전역 설정·프로젝트 설정의 허용 규칙과 hook의 승인은 이 목록에 합쳐진다.
+- 거부된 명령의 원문이 `permission_denials`에 남고 커밋된다. 명령에 비밀 값을 넣지 않는다.
+- 격리가 필요하면 컨테이너·VM 안에서 실행한다.
+
 ## 컴파일 검증 hook
 
 Claude가 응답을 끝낼 때마다 프로젝트 루트에서 컴파일 커맨드를 돌린다.
@@ -137,10 +162,12 @@ Gradle(8.2.1 wrapper) + Spring Boot 3.1.3 + JDK 17 샘플 프로젝트에서 실
   - 세션이 blocked를 적었을 때의 중단 기록과 exit 2, 복구 절차 뒤 재실행과 phase 완료
   - 세션이 error를 적었을 때 3회 시도 뒤 실패 기록과 exit 1, 통과하지 않은 코드가 커밋되지 않고 작업 트리에 남는 것
   - step 세션이 끝날 때마다 컴파일 검증 hook이 도는 것
+  - 권한 제한: 프로젝트 안 편집과 `./gradlew` 실행은 통과, `git tag`·`git commit`·프로젝트 밖 쓰기·`.claude/` 아래 쓰기는 거부되고 거부 내역이 기록되는 것
 - 확인하지 않음
   - 세션은 완료라고 적었는데 `execute.py`의 빌드가 실패하는 경우
   - 세션 시간 초과, 세션이 커밋한 경우
   - 컴파일 검증 hook의 차단 (컴파일이 깨진 적이 없었다)
+  - `allowed_tools`로 명령을 더한 phase, 세션이 `allowed_tools`를 고친 경우의 되돌림 (단위 시험으로만 확인)
   - Maven 프로젝트, `/bootstrap`
 
 ## 프레임워크 자체 테스트

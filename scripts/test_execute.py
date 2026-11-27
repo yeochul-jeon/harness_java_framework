@@ -424,7 +424,7 @@ class TestCommitStep:
 # _invoke_claude (mocked)
 # ---------------------------------------------------------------------------
 
-def _fake_popen(stdout="{}", returncode=0):
+def _fake_popen(stdout='{"permission_denials": []}', returncode=0):
     proc = MagicMock(returncode=returncode)
     proc.communicate.return_value = (stdout, "")
     return proc
@@ -441,7 +441,7 @@ class TestInvokeClaude:
         cmd = mock_popen.call_args[0][0]
         assert cmd[0] == "claude"
         assert "-p" in cmd
-        assert "--dangerously-skip-permissions" in cmd
+        assert "--dangerously-skip-permissions" not in cmd
         assert "--output-format" in cmd
         assert "PREAMBLE" in cmd[-1]
         assert "UI를 구현하세요" in cmd[-1]
@@ -1879,3 +1879,309 @@ class TestSessionOutputNotCommitted:
         assert "phases/ABC-1234/step1-output.json" not in committed
         assert "phases/ABC-1234/step2-output.json" not in committed
         assert "phases/ABC-5678/step0-output.json" not in committed
+
+
+DEFAULT_TOOLS = ["Bash(./gradlew *)", "Bash(./mvnw *)"]
+
+
+def _tools_in(cmd):
+    i = cmd.index("--allowedTools")
+    j = cmd.index("--output-format")
+    return cmd[i + 1:j]
+
+
+def _set_index(executor, **fields):
+    idx = json.loads(executor._index_file.read_text())
+    idx.update(fields)
+    executor._index_file.write_text(json.dumps(idx, ensure_ascii=False))
+
+
+def _denials_json(*items):
+    return json.dumps({"type": "result", "subtype": "success", "permission_denials": [
+        {"tool_name": n, "tool_input": i} for n, i in items]})
+
+
+_REAL_POPEN = subprocess.Popen
+
+
+def _popen_session(executor, stdout, argvs, mutate=None):
+    """claude 호출만 흉내: argv 를 적고, index 의 step 2 를 completed 로 적은 뒤 stdout 을 돌려준다(git 등은 실제로 돈다)."""
+    def fake(cmd, **kw):
+        if cmd[0] != "claude":
+            return _REAL_POPEN(cmd, **kw)
+        argvs.append(cmd)
+        idx = json.loads(executor._index_file.read_text())
+        idx["steps"][2]["status"] = "completed"
+        idx["steps"][2]["summary"] = "UI"
+        if mutate:
+            mutate(idx)
+        executor._index_file.write_text(json.dumps(idx, ensure_ascii=False))
+        return _fake_popen(stdout)
+    return fake
+
+
+class TestSessionPermissions:
+    """세션은 편집 자동 승인 모드 + 승인 창 없음 + 빌드 래퍼 허용 목록으로 뜨고, phase 가 목록을 늘릴 수 있다."""
+
+    def test_default_argv(self, executor):
+        with patch("subprocess.Popen", return_value=_fake_popen()) as m:
+            executor._invoke_claude({"step": 2, "name": "ui"}, "PRE\n")
+        cmd = m.call_args[0][0]
+        assert cmd[:7] == ["claude", "-p", "--permission-mode", "acceptEdits",
+                           "--permission-prompts", "none", "--allowedTools"]
+        assert _tools_in(cmd) == DEFAULT_TOOLS
+        assert cmd[-3:-1] == ["--output-format", "json"]
+        assert cmd[-1].startswith("PRE\n")
+
+    def test_phase_tools_appended(self, executor):
+        _set_index(executor, allowed_tools=["Bash(docker compose *)"])
+        executor._allowed_tools = executor._load_allowed_tools()
+        with patch("subprocess.Popen", return_value=_fake_popen()) as m:
+            executor._invoke_claude({"step": 2, "name": "ui"}, "PRE\n")
+        assert _tools_in(m.call_args[0][0]) == DEFAULT_TOOLS + ["Bash(docker compose *)"]
+
+    def test_no_field_gives_defaults(self, executor):
+        assert executor._load_allowed_tools() == DEFAULT_TOOLS
+
+    @pytest.mark.parametrize("bad", ["Bash(x)", ["Bash(x)", 3], {"a": 1}, None, 5])
+    def test_not_string_array_stops(self, executor, capsys, bad):
+        _set_index(executor, allowed_tools=bad)
+        with pytest.raises(SystemExit) as e:
+            executor._load_allowed_tools()
+        assert e.value.code == 1
+        assert "ERROR" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("bad", ["", "  ", "--dangerously-skip-permissions", " -x"])
+    def test_option_like_or_empty_entry_stops(self, executor, capsys, bad):
+        _set_index(executor, allowed_tools=["Bash(make *)", bad])
+        with pytest.raises(SystemExit) as e:
+            executor._load_allowed_tools()
+        assert e.value.code == 1
+        assert "ERROR" in capsys.readouterr().out
+
+    def test_run_loads_after_checkout(self, executor):
+        order = []
+        for name in ["_print_header", "_check_clean_tree", "_check_blockers", "_checkout_branch",
+                     "_load_guardrails", "_ensure_created_at", "_execute_all_steps", "_finalize"]:
+            setattr(executor, name, (lambda n: lambda *a, **k: order.append(n))(name))
+        executor._load_build_command = lambda: "true"
+        loaded = DEFAULT_TOOLS + ["Bash(make *)"]
+        executor._load_allowed_tools = lambda: order.append("_load_allowed_tools") or loaded
+        executor.run()
+        assert executor._allowed_tools is loaded
+        assert order.index("_checkout_branch") < order.index("_load_allowed_tools") < order.index("_execute_all_steps")
+        # 잘못된 목록이 blocked(exit 2) 판정을 가리지 않게 차단 판정 뒤에 읽는다.
+        assert order.index("_check_blockers") < order.index("_load_allowed_tools")
+
+    def test_session_cannot_widen_its_own_list(self, executor):
+        argvs = []
+        plant = lambda idx: idx.update(allowed_tools=["Bash(*)"])
+        executor._commit_step = MagicMock()
+        executor._build_cmd = "test -f marker || { touch marker; exit 1; }"
+        with patch("subprocess.Popen", side_effect=_popen_session(executor, _denials_json(), argvs, plant)):
+            assert executor._execute_single_step({"step": 2, "name": "ui"}, "") is True
+        assert len(argvs) == 2
+        assert all(_tools_in(c) == DEFAULT_TOOLS for c in argvs)
+
+    def test_rule_against_workarounds_in_prompt(self, executor):
+        pre = executor._build_preamble("G", "")
+        assert "우회하지 마라" in pre
+        assert "blocked_reason" in pre.split("우회하지 마라")[1]
+
+
+class TestPermissionDenialsRecorded:
+    """거부 내역은 화면과 step 필드에 남고, 판정은 바뀌지 않는다."""
+
+    def _run(self, executor, stdout, mutate=None):
+        argvs = []
+        executor._commit_step = MagicMock()
+        executor._build_cmd = "true"
+        with patch("subprocess.Popen", side_effect=_popen_session(executor, stdout, argvs, mutate)):
+            assert executor._execute_single_step({"step": 2, "name": "ui"}, "") is True
+        return json.loads(executor._index_file.read_text())["steps"][2]
+
+    def test_denials_shown_and_stored(self, executor, capsys):
+        s = self._run(executor, _denials_json(
+            ("Bash", {"command": "git commit -m x"}),
+            ("Write", {"file_path": "/elsewhere/x.txt", "content": "FILE-BODY-NOT-STORED"}),
+        ))
+        out = capsys.readouterr().out
+        assert "⚠ 권한 거부 2건 — Bash: git commit -m x; Write: /elsewhere/x.txt" in out
+        assert s["status"] == "completed"
+        assert s["permission_denials"] == ["Bash: git commit -m x", "Write: /elsewhere/x.txt"]
+        assert "FILE-BODY-NOT-STORED" not in executor._index_file.read_text()
+
+    def test_odd_items_do_not_break(self, executor):
+        s = self._run(executor, _denials_json(("Bash", {"command": 3}), ("WebFetch", {"url": "https://example.invalid/a"}),
+                                              ("Task", "not-a-dict")))
+        assert s["permission_denials"] == ["Bash", "WebFetch: https://example.invalid/a", "Task"]
+
+    def test_blocked_keeps_denials_and_exits_2(self, executor):
+        executor._commit_state = MagicMock()
+        def mutate(idx):
+            idx["steps"][2]["status"] = "blocked"
+            idx["steps"][2]["blocked_reason"] = "git push 거부됨"
+        with patch("subprocess.Popen", side_effect=_popen_session(
+                executor, _denials_json(("Bash", {"command": "git push"})), [], mutate)):
+            with pytest.raises(SystemExit) as e:
+                executor._execute_single_step({"step": 2, "name": "ui"}, "")
+        assert e.value.code == 2
+        s = json.loads(executor._index_file.read_text())["steps"][2]
+        assert s["permission_denials"] == ["Bash: git push"]
+
+    def test_retry_replaces_previous_attempt(self, executor, capsys):
+        outs = iter([_denials_json(("Bash", {"command": "make clean"})), _denials_json()])
+        argvs = []
+        def fake(cmd, **kw):
+            if cmd[0] != "claude":
+                return _REAL_POPEN(cmd, **kw)
+            return _popen_session(executor, next(outs), argvs)(cmd, **kw)
+        executor._commit_step = MagicMock()
+        executor._build_cmd = "test -f marker || { touch marker; exit 1; }"
+        with patch("subprocess.Popen", side_effect=fake):
+            assert executor._execute_single_step({"step": 2, "name": "ui"}, "") is True
+        assert len(argvs) == 2
+        assert "⚠ 권한 거부 1건 — Bash: make clean" in capsys.readouterr().out  # 1회차 거부는 화면에 남는다
+        assert "permission_denials" not in json.loads(executor._index_file.read_text())["steps"][2]
+
+    def test_lone_surrogate_is_written(self, executor):
+        # JSON 이스케이프된 단독 서로게이트는 디코딩하면 UTF-8 로 쓸 수 없는 문자가 된다.
+        stdout = '{"permission_denials": [{"tool_name": "Bash", "tool_input": {"command": "echo \\ud800 x"}}]}'
+        s = self._run(executor, stdout)
+        assert s["status"] == "completed"
+        assert s["permission_denials"][0].startswith("Bash: echo ")
+        assert s["permission_denials"][0].encode("utf-8")
+        out = json.loads((executor._phase_dir / "step2-output.json").read_text(encoding="utf-8"))
+        assert out["permissionDenials"] == s["permission_denials"]
+
+    def test_unexpected_error_warns_and_continues(self, executor, capsys):
+        executor.DENIAL_ITEM_MAX = None  # 요약 중 예상 밖 예외(TypeError)를 낸다
+        s = self._run(executor, _denials_json(("Bash", {"command": "git push"})))
+        assert "WARN: 권한 거부 기록을 읽지 못했다" in capsys.readouterr().out
+        assert s["status"] == "completed"
+        assert "permission_denials" not in s
+
+    def test_long_item_is_cut(self, executor):
+        s = self._run(executor, _denials_json(("Bash", {"command": "echo " + "a" * 500})))
+        assert len(s["permission_denials"][0]) <= 120
+
+    def test_none_removes_planted_field(self, executor, capsys):
+        plant = lambda idx: idx["steps"][2].update(permission_denials=["심은 값"])
+        s = self._run(executor, _denials_json(), plant)
+        assert "permission_denials" not in s
+        assert "권한 거부" not in capsys.readouterr().out
+
+    @pytest.mark.parametrize("stdout", ["not json", "{}", '{"permission_denials": "x"}', '[1]'],
+                             ids=["not-json", "no-key", "not-list", "not-object"])
+    def test_unreadable_output_warns_and_continues(self, executor, capsys, stdout):
+        s = self._run(executor, stdout)
+        assert "WARN: 권한 거부 기록을 읽지 못했다" in capsys.readouterr().out
+        assert s["status"] == "completed"
+        assert "permission_denials" not in s
+
+    def test_timeout_does_not_parse(self, executor, capsys):
+        proc = _fake_popen("")
+        proc.communicate.side_effect = [subprocess.TimeoutExpired("claude", 1), ("", "")]
+        with patch("subprocess.Popen", return_value=proc), patch.object(ex.StepExecutor, "_kill_group"):
+            out = executor._invoke_claude({"step": 2, "name": "ui"}, "PRE\n")
+        assert out["timedOut"] is True
+        assert "권한 거부 기록" not in capsys.readouterr().out
+
+
+class TestOldClaudeCli:
+    """호출 인자를 모르는 Claude Code 는 재시도 없이 멈춘다."""
+
+    @staticmethod
+    def _claude_failing_with(tmp_path, monkeypatch, stderr_line):
+        """rc 1·빈 stdout·stderr 한 줄을 내는 가짜 claude. 호출 횟수 파일을 돌려준다."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        calls = tmp_path / "calls"
+        script = bin_dir / "claude"
+        script.write_text(textwrap.dedent(f"""\
+            #!{sys.executable}
+            import sys
+            open({str(calls)!r}, "a").write("x")
+            sys.stderr.write({stderr_line + chr(10)!r})
+            sys.exit(1)
+            """))
+        script.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+        return calls
+
+    def test_other_programs_unknown_option_is_not_old_cli(self, executor, tmp_path, monkeypatch, capsys):
+        calls = self._claude_failing_with(tmp_path, monkeypatch, "helper: unknown option 'x'")
+        executor._commit_state = MagicMock()
+        executor._build_cmd = "true"
+        with pytest.raises(SystemExit) as e:
+            executor._execute_single_step({"step": 2, "name": "ui"}, "")
+        assert e.value.code == 1
+        assert calls.read_text() == "x" * ex.StepExecutor.MAX_RETRIES  # 기존 재시도 경로
+        assert "v2.1.259" not in capsys.readouterr().out
+        assert json.loads(executor._index_file.read_text())["steps"][2]["status"] == "error"
+
+    def test_unknown_option_stops_without_retry(self, executor, tmp_path, monkeypatch, capsys):
+        calls = self._claude_failing_with(tmp_path, monkeypatch, "error: unknown option '--permission-prompts'")
+        executor._commit_state = MagicMock()
+        executor._commit_step = MagicMock()
+        executor._build_cmd = "true"
+        before = executor._index_file.read_text()
+        with pytest.raises(SystemExit) as e:
+            executor._execute_single_step({"step": 2, "name": "ui"}, "")
+        assert e.value.code == 1
+        assert calls.read_text() == "x"
+        out = capsys.readouterr().out
+        assert "error: unknown option '--permission-prompts'" in out
+        assert "v2.1.259" in out
+        assert executor._index_file.read_text() == before
+        executor._commit_state.assert_not_called()
+
+
+class TestSessionCannotChangeAllowedTools:
+    """세션이 phase index 의 allowed_tools 를 바꾸면 실행기가 세션 전 값으로 되돌리고 경고한다. 판정은 그대로."""
+
+    def _run(self, executor, mutate, status="completed"):
+        def m(idx):
+            mutate(idx)
+            if status == "blocked":
+                idx["steps"][2]["status"] = "blocked"
+                idx["steps"][2]["blocked_reason"] = "키 없음"
+        executor._commit_step = MagicMock()
+        executor._commit_state = MagicMock()
+        executor._build_cmd = "true"
+        with patch("subprocess.Popen", side_effect=_popen_session(executor, _denials_json(), [], m)):
+            if status == "blocked":
+                with pytest.raises(SystemExit) as e:
+                    executor._execute_single_step({"step": 2, "name": "ui"}, "")
+                assert e.value.code == 2
+            else:
+                assert executor._execute_single_step({"step": 2, "name": "ui"}, "") is True
+        return json.loads(executor._index_file.read_text())
+
+    def test_added_field_is_removed(self, executor, capsys):
+        idx = self._run(executor, lambda i: i.update(allowed_tools=["Bash(*)"]))
+        assert "allowed_tools" not in idx
+        assert idx["steps"][2]["status"] == "completed"
+        assert "⚠ 세션이 allowed_tools 를 바꿨다" in capsys.readouterr().out
+
+    def test_changed_field_is_restored(self, executor, capsys):
+        _set_index(executor, allowed_tools=["Bash(make *)"])
+        idx = self._run(executor, lambda i: i["allowed_tools"].append("Bash(*)"))
+        assert idx["allowed_tools"] == ["Bash(make *)"]
+        assert "⚠ 세션이 allowed_tools 를 바꿨다" in capsys.readouterr().out
+
+    def test_removed_field_is_restored(self, executor):
+        _set_index(executor, allowed_tools=["Bash(make *)"])
+        idx = self._run(executor, lambda i: i.pop("allowed_tools"))
+        assert idx["allowed_tools"] == ["Bash(make *)"]
+
+    def test_restored_on_blocked(self, executor):
+        idx = self._run(executor, lambda i: i.update(allowed_tools=["Bash(*)"]), status="blocked")
+        assert "allowed_tools" not in idx
+        assert idx["steps"][2]["status"] == "blocked"
+
+    def test_untouched_gives_no_warning(self, executor, capsys):
+        _set_index(executor, allowed_tools=["Bash(make *)"])
+        idx = self._run(executor, lambda i: None)
+        assert idx["allowed_tools"] == ["Bash(make *)"]
+        assert "allowed_tools 를 바꿨다" not in capsys.readouterr().out
